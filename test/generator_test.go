@@ -86,6 +86,77 @@ func TestRestServerGeneratorNoSql(t *testing.T) {
 	}
 }
 
+func TestRestServerGeneratorNoSqlScyllaDB(t *testing.T) {
+	restServerConfigJSON := `{
+        "edges": [],
+        "nodes": [
+            {
+                "id": "node-ef",
+                "name": "user-service",
+                "language": "go",
+                "restConfig": {
+                    "server": {
+                        "noSQLDB": "ScyllaDB",
+                        "port": "1337",
+                        "resources": [
+                            {
+                                "fields": {
+                                    "Name": {
+                                        "datatype": "string"
+                                    },
+                                    "Address": {
+                                        "datatype": "Address"
+                                    },
+                                    "Age": {
+                                        "datatype": "int"
+                                    }
+                                },
+                                "name": "User"
+                            },
+                            {
+                                "fields": {
+                                    "Street": {
+                                        "datatype": "string"
+                                    },
+                                    "PinCode": {
+                                        "datatype": "string"
+                                    },
+                                    "City": {
+                                        "datatype": "string"
+                                    }
+                                },
+                                "name": "Address"
+                            }
+                        ]
+                    },
+                    "framework": "go-gin-server",
+                    "template": "compage"
+                }
+            }
+        ]
+    }`
+	input := project.GenerateCodeRequest{
+		GitPlatformURL:      "https://github.com",
+		GitPlatformUserName: "azar-intelops",
+		GitRepositoryName:   "first-rest-server-project-nosql-scyllaDB",
+		ProjectName:         "first-rest-server-project-nosql-scyllaDB",
+		ProjectJSON:         restServerConfigJSON,
+	}
+	defer func() {
+		_ = os.RemoveAll(utils.GetProjectDirectoryName("first-rest-server-project-nosql-scyllaDB"))
+	}()
+
+	// retrieve project struct
+	getProject, err := grpc.GetProject(&input)
+	if err != nil {
+		t.Errorf("grpc.GetProject conversion failed = %v", getProject)
+	}
+	// trigger project generation
+	if err0 := handlers.Handle(getProject); err0 != nil {
+		t.Errorf("handlers.Handle failed %s", err0.Error())
+	}
+}
+
 func TestRestServerGeneratorSqlMap(t *testing.T) {
 	restServerConfigJSON := `{
     "edges": [],

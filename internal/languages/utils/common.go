@@ -114,6 +114,31 @@ func GetMySQLDataType(value string) string {
 	return "VARCHAR(100)"
 }
 
+func GetColumnBasedDBDataType(value string) string {
+	if value == "int8" || value == "uint8" {
+		return "int"
+	} else if value == "int16" || value == "uint16" {
+		return "int"
+	} else if value == "int" || value == "int32" || value == "uint" || value == "uint32" || value == "rune" ||
+		value == "byte" ||
+		value == "uintptr" {
+		return "int"
+	} else if value == "int64" || value == "uint64" {
+		return "bigint"
+	} else if value == "float32" {
+		return "float"
+	} else if value == "float64" {
+		return "double"
+	} else if value == "complex64" || value == "complex128" {
+		return "decimal"
+	} else if value == "bool" {
+		return "Boolean"
+	} else if value == "string" {
+		return "text"
+	}
+	return "text"
+}
+
 func GetDefaultValueForDataType(value string) interface{} {
 	if value == "int" ||
 		value == "int16" ||
