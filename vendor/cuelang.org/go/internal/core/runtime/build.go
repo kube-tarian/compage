@@ -23,7 +23,6 @@ import (
 	"cuelang.org/go/cue/errors"
 	"cuelang.org/go/cue/stats"
 	"cuelang.org/go/cue/token"
-	"cuelang.org/go/internal"
 	"cuelang.org/go/internal/core/adt"
 	"cuelang.org/go/internal/core/compile"
 )
@@ -80,7 +79,7 @@ func (x *Runtime) Build(cfg *Config, b *build.Instance) (v *adt.Vertex, errs err
 	v, err = compile.Files(cc, x, b.ID(), b.Files...)
 	errs = errors.Append(errs, err)
 
-	errs = errors.Append(errs, x.injectImplementations(b, v))
+	errs = errors.Append(errs, x.InjectImplementations(b, v))
 
 	if errs != nil {
 		v = adt.ToVertex(&adt.Bottom{Err: errs})
@@ -119,7 +118,7 @@ func (r *Runtime) CompileFile(cfg *Config, file *ast.File) (*adt.Vertex, *build.
 	if err != nil {
 		return nil, p
 	}
-	_, p.PkgName, _ = internal.PackageInfo(file)
+	p.PkgName = file.PackageName()
 	v, _ := r.Build(cfg, p)
 	return v, p
 }

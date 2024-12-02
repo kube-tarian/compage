@@ -25,36 +25,35 @@ import (
 	"cuelang.org/go/cue/build"
 	"cuelang.org/go/cue/errors"
 	"cuelang.org/go/cue/token"
-	"cuelang.org/go/internal/encoding"
 	"cuelang.org/go/internal/mod/modpkgload"
-
-	// Trigger the unconditional loading of all core builtin packages if load
-	// is used. This was deemed the simplest way to avoid having to import
-	// this line explicitly, and thus breaking existing code, for the majority
-	// of cases, while not introducing an import cycle.
-	_ "cuelang.org/go/pkg"
 )
 
 type loader struct {
-	cfg      *Config
-	tagger   *tagger
-	stk      importStack
-	loadFunc build.LoadFunc
-	pkgs     *modpkgload.Packages
+	cfg    *Config
+	tagger *tagger
+	stk    importStack
+	pkgs   *modpkgload.Packages
+
+	// dirCachedBuildFiles caches the work involved when reading a
+	// directory. It is keyed by directory name. When we descend into
+	// subdirectories to load patterns such as ./... we often end up
+	// loading parent directories many times over; this cache
+	// amortizes that work.
+	dirCachedBuildFiles map[string]cachedDirFiles
+}
+
+type cachedDirFiles struct {
+	err       errors.Error
+	filenames []string
 }
 
 func newLoader(c *Config, tg *tagger, pkgs *modpkgload.Packages) *loader {
-	l := &loader{
-		cfg:    c,
-		tagger: tg,
-		pkgs:   pkgs,
+	return &loader{
+		cfg:                 c,
+		tagger:              tg,
+		pkgs:                pkgs,
+		dirCachedBuildFiles: make(map[string]cachedDirFiles),
 	}
-	l.loadFunc = l._loadFunc
-	return l
-}
-
-func (l *loader) buildLoadFunc() build.LoadFunc {
-	return l.loadFunc
 }
 
 func (l *loader) abs(filename string) string {
@@ -76,10 +75,8 @@ func (l *loader) errPkgf(importPos []token.Pos, format string, args ...interface
 // cueFilesPackage creates a package for building a collection of CUE files
 // (typically named on the command line).
 func (l *loader) cueFilesPackage(files []*build.File) *build.Instance {
-	cfg := l.cfg
-	cfg.filesMode = true
 	// ModInit() // TODO: support modules
-	pkg := l.cfg.Context.NewInstance(cfg.Dir, l.loadFunc)
+	pkg := l.cfg.Context.NewInstance(l.cfg.Dir, l.loadFunc())
 
 	for _, bf := range files {
 		f := bf.Filename
@@ -87,24 +84,28 @@ func (l *loader) cueFilesPackage(files []*build.File) *build.Instance {
 			continue
 		}
 		if !filepath.IsAbs(f) {
-			f = filepath.Join(cfg.Dir, f)
+			f = filepath.Join(l.cfg.Dir, f)
 		}
-		fi, err := cfg.fileSystem.stat(f)
+		fi, err := l.cfg.fileSystem.stat(f)
 		if err != nil {
-			return cfg.newErrInstance(errors.Wrapf(err, token.NoPos, "could not find file %v", f))
+			return l.cfg.newErrInstance(errors.Wrapf(err, token.NoPos, "could not find file %v", f))
 		}
 		if fi.IsDir() {
-			return cfg.newErrInstance(errors.Newf(token.NoPos, "file is a directory %v", f))
+			return l.cfg.newErrInstance(errors.Newf(token.NoPos, "file is a directory %v", f))
 		}
 	}
 
-	fp := newFileProcessor(cfg, pkg, l.tagger)
-	for _, file := range files {
-		fp.add(cfg.Dir, file, allowAnonymous)
+	fp := newFileProcessor(l.cfg, pkg, l.tagger)
+	if l.cfg.Package == "*" {
+		fp.allPackages = true
+		pkg.PkgName = "_"
+	}
+	for _, bf := range files {
+		fp.add(l.cfg.Dir, bf, allowAnonymous|allowExcludedFiles)
 	}
 
 	// TODO: ModImportFromFiles(files)
-	pkg.Dir = cfg.Dir
+	pkg.Dir = l.cfg.Dir
 	rewriteFiles(pkg, pkg.Dir, true)
 	for _, err := range errors.Errors(fp.finalize(pkg)) { // ImportDir(&ctxt, dir, 0)
 		var x *NoFilesError
@@ -119,31 +120,22 @@ func (l *loader) cueFilesPackage(files []*build.File) *build.Instance {
 	// 	bp.ImportPath = ModDirImportPath(dir)
 	// }
 
-	l.addFiles(cfg.Dir, pkg)
+	pkg.User = true
+	l.addFiles(pkg)
 
-	pkg.User = true
-	l.stk.Push("user")
 	_ = pkg.Complete()
-	l.stk.Pop()
-	pkg.User = true
-	//pkg.LocalPrefix = dirToImportPath(dir)
 	pkg.DisplayPath = "command-line-arguments"
 
 	return pkg
 }
 
-func (l *loader) addFiles(dir string, p *build.Instance) {
-	for _, f := range p.BuildFiles {
-		d := encoding.NewDecoder(f, &encoding.Config{
-			Stdin:     l.cfg.stdin(),
-			ParseFile: l.cfg.ParseFile,
-		})
-		for ; !d.Done(); d.Next() {
-			_ = p.AddSyntax(d.File())
-		}
-		if err := d.Err(); err != nil {
+// addFiles populates p.Files by reading CUE syntax from p.BuildFiles.
+func (l *loader) addFiles(p *build.Instance) {
+	for _, bf := range p.BuildFiles {
+		f, err := l.cfg.fileSystem.getCUESyntax(bf)
+		if err != nil {
 			p.ReportError(errors.Promote(err, "load"))
 		}
-		d.Close()
+		_ = p.AddSyntax(f)
 	}
 }

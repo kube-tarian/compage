@@ -13,8 +13,10 @@ import (
 
 // Starts an image vulnerability scan. An image scan can only be started once per
 // 24 hours on an individual image. This limit includes if an image was scanned on
-// initial push. For more information, see Image scanning (https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-scanning.html)
-// in the Amazon Elastic Container Registry User Guide.
+// initial push. For more information, see [Image scanning]in the Amazon Elastic Container
+// Registry User Guide.
+//
+// [Image scanning]: https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-scanning.html
 func (c *Client) StartImageScan(ctx context.Context, params *StartImageScanInput, optFns ...func(*Options)) (*StartImageScanOutput, error) {
 	if params == nil {
 		params = &StartImageScanInput{}
@@ -113,6 +115,9 @@ func (c *Client) addOperationStartImageScanMiddlewares(stack *middleware.Stack, 
 	if err = addRecordResponseTiming(stack); err != nil {
 		return err
 	}
+	if err = addSpanRetryLoop(stack, options); err != nil {
+		return err
+	}
 	if err = addClientUserAgent(stack, options); err != nil {
 		return err
 	}
@@ -123,6 +128,12 @@ func (c *Client) addOperationStartImageScanMiddlewares(stack *middleware.Stack, 
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
+		return err
+	}
+	if err = addUserAgentRetryMode(stack, options); err != nil {
 		return err
 	}
 	if err = addOpStartImageScanValidationMiddleware(stack); err != nil {
@@ -144,6 +155,18 @@ func (c *Client) addOperationStartImageScanMiddlewares(stack *middleware.Stack, 
 		return err
 	}
 	if err = addDisableHTTPSMiddleware(stack, options); err != nil {
+		return err
+	}
+	if err = addSpanInitializeStart(stack); err != nil {
+		return err
+	}
+	if err = addSpanInitializeEnd(stack); err != nil {
+		return err
+	}
+	if err = addSpanBuildRequestStart(stack); err != nil {
+		return err
+	}
+	if err = addSpanBuildRequestEnd(stack); err != nil {
 		return err
 	}
 	return nil

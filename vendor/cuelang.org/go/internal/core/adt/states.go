@@ -126,7 +126,7 @@ const (
 	// This is a signal condition that is reached when:
 	//    - a node is set to a concrete scalar value
 	//    - a node is set to an error
-	//    - or if XXXstate is reached.
+	//    - or if ...state is reached.
 	//
 	// TODO: rename to something better?
 	scalarKnown
@@ -166,6 +166,10 @@ const (
 	//
 	subFieldsProcessed
 
+	// disjunctionTask indicates that this task is a disjunction. This is
+	// used to trigger finalization of disjunctions.
+	disjunctionTask
+
 	leftOfMaxCoreCondition
 
 	finalStateKnown condition = leftOfMaxCoreCondition - 1
@@ -192,6 +196,9 @@ const (
 		scalarKnown |
 		valueKnown |
 		fieldConjunctsKnown
+
+	// genericDisjunction is used to record processDisjunction tasks.
+	genericDisjunction = genericConjunct | disjunctionTask
 
 	// a fieldConjunct is on that only adds a new field to the struct.
 	fieldConjunct = allTasksCompleted |
@@ -236,8 +243,9 @@ func stateCompletions(s *scheduler) condition {
 	s.node.Logf("=== stateCompletions: %v  %v", v.Label, s.completed)
 	if x.meets(allAncestorsProcessed) {
 		x |= conditionsUsingCounters &^ s.provided
-		// If we have a pending arc, a sub arc may still cause the arc to
-		// become not pending. For instance, if 'a' is pending in the following
+		// If we have a pending or constraint arc, a sub arc may still cause the
+		// arc to become a member. For instance, if 'a' is pending in the
+		// following
 		//   if x != _!_ {
 		//       a: b: 1
 		//   }
@@ -284,6 +292,15 @@ func stateCompletions(s *scheduler) condition {
 // processed.
 func (v *Vertex) allChildConjunctsKnown() bool {
 	if v == nil {
+		return true
+	}
+
+	if v.Status() == finalized {
+		// This can happen, for instance, if this is called on a parent of a
+		// rooted node that is marked as a parent for a dynamic node.
+		// In practice this should be handled by the caller, but we add this
+		// as an extra safeguard.
+		// TODO: remove this check at some point.
 		return true
 	}
 

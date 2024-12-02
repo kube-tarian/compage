@@ -16,10 +16,12 @@ package cue
 
 import (
 	"bytes"
+	"cmp"
 	"encoding"
 	"encoding/json"
+	"math"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +30,7 @@ import (
 
 	"cuelang.org/go/cue/errors"
 	"cuelang.org/go/internal/core/adt"
+	"cuelang.org/go/internal/cueexperiment"
 )
 
 // Decode initializes the value pointed to by x with Value v.
@@ -75,7 +78,7 @@ func (d *decoder) clear(x reflect.Value) {
 	}
 }
 
-var valueType = reflect.TypeOf(Value{})
+var valueType = reflect.TypeFor[Value]()
 
 func (d *decoder) decode(x reflect.Value, v Value, isPtr bool) {
 	if !x.IsValid() {
@@ -101,7 +104,7 @@ func (d *decoder) decode(x reflect.Value, v Value, isPtr bool) {
 	switch x.Kind() {
 	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Interface:
 		// nullable types
-		if v.Null() == nil || !v.IsConcrete() {
+		if v.IsNull() || !v.IsConcrete() {
 			d.clear(x)
 			return
 		}
@@ -114,10 +117,10 @@ func (d *decoder) decode(x reflect.Value, v Value, isPtr bool) {
 		}
 	}
 
-	ij, it, x := indirect(x, v.Null() == nil)
+	ij, it, x := indirect(x, v.IsNull())
 
 	if ij != nil {
-		b, err := v.marshalJSON()
+		b, err := v.MarshalJSON()
 		d.addErr(err)
 		d.addErr(ij.UnmarshalJSON(b))
 		return
@@ -267,7 +270,17 @@ func (d *decoder) interfaceValue(v Value) (x interface{}) {
 
 	case IntKind:
 		if i, err := v.Int64(); err == nil {
-			return int(i)
+			cueexperiment.Init()
+			if cueexperiment.Flags.DecodeInt64 {
+				return i
+			}
+			// When the decodeint64 experiment is not enabled, we want to return the value
+			// as `int`, but that's not possible for large values on 32-bit architectures.
+			// To avoid overflows causing entirely wrong values to be returned to the user,
+			// let the logic continue below so that we return a *big.Int instead.
+			if i <= math.MaxInt && i >= math.MinInt {
+				return int(i)
+			}
 		}
 		x, err = v.Int(nil)
 
@@ -309,7 +322,7 @@ func (d *decoder) interfaceValue(v Value) (x interface{}) {
 	return x
 }
 
-var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 
 // convertMap keeps an existing map and overwrites any entry found in v,
 // keeping other preexisting entries.
@@ -479,28 +492,22 @@ type goField struct {
 	nameBytes []byte                 // []byte(name)
 	equalFold func(s, t []byte) bool // bytes.EqualFold or equivalent
 
-	nameNonEsc  string // `"` + name + `":`
-	nameEscHTML string // `"` + HTMLEscape(name) + `":`
-
 	tag       bool
 	index     []int
 	typ       reflect.Type
 	omitEmpty bool
 }
 
-// byIndex sorts goField by index sequence.
-type byIndex []goField
-
-func (x byIndex) Less(i, j int) bool {
-	for k, xik := range x[i].index {
-		if k >= len(x[j].index) {
-			return false
+func compareFieldByIndex(a, b goField) int {
+	for i, x := range a.index {
+		if i >= len(b.index) {
+			break
 		}
-		if xik != x[j].index[k] {
-			return xik < x[j].index[k]
+		if c := cmp.Compare(x, b.index[i]); c != 0 {
+			return c
 		}
 	}
-	return len(x[i].index) < len(x[j].index)
+	return cmp.Compare(len(a.index), len(b.index))
 }
 
 // typeFields returns a list of fields that JSON should recognize for the given type.
@@ -519,9 +526,6 @@ func typeFields(t reflect.Type) structFields {
 
 	// Fields found.
 	var fields []goField
-
-	// Buffer to run HTMLEscape on field names.
-	var nameEscBuf bytes.Buffer
 
 	for len(next) > 0 {
 		current, next = next, current[:0]
@@ -586,14 +590,6 @@ func typeFields(t reflect.Type) structFields {
 					field.nameBytes = []byte(field.name)
 					field.equalFold = foldFunc(field.nameBytes)
 
-					// Build nameEscHTML and nameNonEsc ahead of time.
-					nameEscBuf.Reset()
-					nameEscBuf.WriteString(`"`)
-					json.HTMLEscape(&nameEscBuf, field.nameBytes)
-					nameEscBuf.WriteString(`":`)
-					field.nameEscHTML = nameEscBuf.String()
-					field.nameNonEsc = `"` + field.name + `":`
-
 					fields = append(fields, field)
 					if count[f.typ] > 1 {
 						// If there were multiple instances, add a second,
@@ -614,21 +610,24 @@ func typeFields(t reflect.Type) structFields {
 		}
 	}
 
-	sort.Slice(fields, func(i, j int) bool {
-		x := fields
+	slices.SortFunc(fields, func(a, b goField) int {
 		// sort field by name, breaking ties with depth, then
 		// breaking ties with "name came from json tag", then
 		// breaking ties with index sequence.
-		if x[i].name != x[j].name {
-			return x[i].name < x[j].name
+		if c := cmp.Compare(a.name, b.name); c != 0 {
+			return c
 		}
-		if len(x[i].index) != len(x[j].index) {
-			return len(x[i].index) < len(x[j].index)
+		if c := cmp.Compare(len(a.index), len(b.index)); c != 0 {
+			return c
 		}
-		if x[i].tag != x[j].tag {
-			return x[i].tag
+		if a.tag != b.tag {
+			if a.tag {
+				return 1
+			} else {
+				return -1
+			}
 		}
-		return byIndex(x).Less(i, j)
+		return compareFieldByIndex(a, b)
 	})
 
 	// Delete all fields that are hidden by the Go rules for embedded fields,
@@ -660,7 +659,7 @@ func typeFields(t reflect.Type) structFields {
 	}
 
 	fields = out
-	sort.Slice(fields, byIndex(fields).Less)
+	slices.SortFunc(fields, compareFieldByIndex)
 
 	nameIndex := make(map[string]int, len(fields))
 	for i, field := range fields {

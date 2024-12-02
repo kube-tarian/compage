@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -36,7 +36,6 @@ import (
 	"cuelang.org/go/internal"
 	"cuelang.org/go/internal/core/adt"
 	"cuelang.org/go/internal/core/compile"
-	internaljson "cuelang.org/go/internal/encoding/json"
 	"cuelang.org/go/internal/types"
 )
 
@@ -71,7 +70,8 @@ func toValue(e adt.Expr) adt.Value {
 func compileExpr(ctx *adt.OpContext, expr ast.Expr) adt.Value {
 	c, err := compile.Expr(nil, ctx, pkgID(), expr)
 	if err != nil {
-		return &adt.Bottom{Err: errors.Promote(err, "compile")}
+		return &adt.Bottom{
+			Err: errors.Promote(err, "compile")}
 	}
 	return adt.Resolve(ctx, c)
 }
@@ -183,15 +183,6 @@ func isOmitEmpty(f *reflect.StructField) bool {
 	return isOmitEmpty
 }
 
-// parseJSON parses JSON into a CUE value. b must be valid JSON.
-func parseJSON(ctx *adt.OpContext, b []byte) adt.Value {
-	expr, err := parser.ParseExpr("json", b)
-	if err != nil {
-		panic(err) // cannot happen
-	}
-	return compileExpr(ctx, expr)
-}
-
 func GoValueToExpr(ctx *adt.OpContext, nilIsTop bool, x interface{}) adt.Expr {
 	e := convertRec(ctx, nilIsTop, x)
 	if e == nil {
@@ -228,7 +219,7 @@ func convertRec(ctx *adt.OpContext, nilIsTop bool, x interface{}) adt.Value {
 		if err != nil {
 			return &adt.Bottom{Err: errors.Promote(err, "compile")}
 		}
-		if len(x.Conjuncts) != 1 {
+		if _, n := x.SingleConjunct(); n != 1 {
 			panic("unexpected length")
 		}
 		return x
@@ -286,19 +277,19 @@ func convertRec(ctx *adt.OpContext, nilIsTop bool, x interface{}) adt.Value {
 		if err != nil {
 			return ctx.AddErr(errors.Promote(err, "json.Marshaler"))
 		}
-
-		return parseJSON(ctx, b)
+		expr, err := parser.ParseExpr("json", b)
+		if err != nil {
+			panic(err) // cannot happen
+		}
+		return compileExpr(ctx, expr)
 
 	case encoding.TextMarshaler:
 		b, err := v.MarshalText()
 		if err != nil {
 			return ctx.AddErr(errors.Promote(err, "encoding.TextMarshaler"))
 		}
-		b, err = internaljson.Marshal(string(b))
-		if err != nil {
-			return ctx.AddErr(errors.Promote(err, "json"))
-		}
-		return parseJSON(ctx, b)
+		s, _ := unicode.UTF8.NewEncoder().String(string(b))
+		return &adt.String{Src: ctx.Source(), Str: s}
 
 	case error:
 		var errs errors.Error
@@ -340,14 +331,15 @@ func convertRec(ctx *adt.OpContext, nilIsTop bool, x interface{}) adt.Value {
 		return toUint(ctx, uint64(v))
 	case float64:
 		n := &adt.Num{Src: src, K: adt.FloatKind}
-		_, _, err := n.X.SetString(fmt.Sprint(v))
+		_, err := n.X.SetFloat64(v)
 		if err != nil {
 			return ctx.AddErr(errors.Promote(err, "invalid float"))
 		}
 		return n
 	case float32:
 		n := &adt.Num{Src: src, K: adt.FloatKind}
-		_, _, err := n.X.SetString(fmt.Sprint(v))
+		// apd.Decimal has a SetFloat64 method, but no SetFloat32.
+		_, _, err := n.X.SetString(strconv.FormatFloat(float64(v), 'E', -1, 32))
 		if err != nil {
 			return ctx.AddErr(errors.Promote(err, "invalid float"))
 		}
@@ -479,12 +471,10 @@ func convertRec(ctx *adt.OpContext, nilIsTop bool, x interface{}) adt.Value {
 				reflect.Uint, reflect.Uint8, reflect.Uint16,
 				reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 
-				keys := value.MapKeys()
-				sort.Slice(keys, func(i, j int) bool {
-					return fmt.Sprint(keys[i]) < fmt.Sprint(keys[j])
-				})
-				for _, k := range keys {
-					val := value.MapIndex(k)
+				iter := value.MapRange()
+				for iter.Next() {
+					k := iter.Key()
+					val := iter.Value()
 					// if isNil(val) {
 					// 	continue
 					// }
@@ -513,6 +503,9 @@ func convertRec(ctx *adt.OpContext, nilIsTop bool, x interface{}) adt.Value {
 					}
 					v.Arcs = append(v.Arcs, arc)
 				}
+				slices.SortFunc(v.Arcs, func(a, b *adt.Vertex) int {
+					return strings.Compare(a.Label.IdentString(ctx), b.Label.IdentString(ctx))
+				})
 			}
 
 			return v
@@ -558,8 +551,8 @@ func convertGoType(ctx *adt.OpContext, t reflect.Type) adt.Expr {
 }
 
 var (
-	jsonMarshaler = reflect.TypeOf(new(json.Marshaler)).Elem()
-	textMarshaler = reflect.TypeOf(new(encoding.TextMarshaler)).Elem()
+	jsonMarshaler = reflect.TypeFor[json.Marshaler]()
+	textMarshaler = reflect.TypeFor[encoding.TextMarshaler]()
 	topSentinel   = ast.NewIdent("_")
 )
 

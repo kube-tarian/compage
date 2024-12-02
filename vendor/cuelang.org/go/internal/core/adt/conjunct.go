@@ -14,7 +14,11 @@
 
 package adt
 
-import "fmt"
+import (
+	"fmt"
+
+	"cuelang.org/go/cue/ast"
+)
 
 // This file contains functionality for processing conjuncts to insert the
 // corresponding values in the Vertex.
@@ -31,6 +35,8 @@ import "fmt"
 // scheduleConjunct splits c into parts to be incrementally processed and queues
 // these parts up for processing. it will itself not cause recursive processing.
 func (n *nodeContext) scheduleConjunct(c Conjunct, id CloseInfo) {
+	n.assertInitialized()
+
 	// Explanation of switch statement:
 	//
 	// A Conjunct can be a leaf or, through a ConjunctGroup, a tree. The tree
@@ -63,10 +69,10 @@ func (n *nodeContext) scheduleConjunct(c Conjunct, id CloseInfo) {
 		// conjunct represents an embedding or definition, we need to create a
 		// new closeContext to represent this.
 		if id.cc == nil {
-			id.cc = n.node.rootCloseContext()
+			id.cc = n.node.rootCloseContext(n.ctx)
 		}
 		if id.cc == cc {
-			panic("inconsistent state")
+			panic("inconsistent state: same closeContext")
 		}
 		var t closeNodeType
 		if c.CloseInfo.FromDef {
@@ -76,15 +82,21 @@ func (n *nodeContext) scheduleConjunct(c Conjunct, id CloseInfo) {
 			t |= closeEmbed
 		}
 		if t != 0 {
-			id, _ = id.spawnCloseContext(t)
+			id, _ = id.spawnCloseContext(n.ctx, t)
 		}
 		if !id.cc.done {
-			id.cc.incDependent(DEFER, nil)
+			id.cc.incDependent(n.ctx, DEFER, nil)
 			defer id.cc.decDependent(n.ctx, DEFER, nil)
 		}
 
 		if id.cc.src != n.node {
-			panic("inconsistent state")
+			// TODO(#3406): raise a panic again.
+			//		out: d & { d }
+			//		d: {
+			//			kind: "foo" | "bar"
+			//			{ kind: "foo" } | { kind: "bar" }
+			//		}
+			// panic("inconsistent state: nodes differ")
 		}
 	default:
 
@@ -107,7 +119,7 @@ func (n *nodeContext) scheduleConjunct(c Conjunct, id CloseInfo) {
 	env := c.Env
 
 	if id.cc.isDef {
-		n.node.Closed = true
+		n.node.ClosedRecursive = true
 	}
 
 	switch x := c.Elem().(type) {
@@ -132,30 +144,45 @@ func (n *nodeContext) scheduleConjunct(c Conjunct, id CloseInfo) {
 		}
 
 	case *Vertex:
+		// TODO: move this logic to scheduleVertexConjuncts or at least ensure
+		// that we can also share data Vertices?
 		if x.IsData() {
+			n.unshare()
 			n.insertValueConjunct(env, x, id)
 		} else {
 			n.scheduleVertexConjuncts(c, x, id)
 		}
 
 	case Value:
+		// TODO: perhaps some values could be shared.
+		n.unshare()
 		n.insertValueConjunct(env, x, id)
 
 	case *BinaryExpr:
+		// NOTE: do not unshare: a conjunction could still allow structure
+		// sharing, such as in the case of `ref & ref`.
 		if x.Op == AndOp {
 			n.scheduleConjunct(MakeConjunct(env, x.X, id), id)
 			n.scheduleConjunct(MakeConjunct(env, x.Y, id), id)
 			return
 		}
+
+		n.unshare()
 		// Even though disjunctions and conjunctions are excluded, the result
 		// must may still be list in the case of list arithmetic. This could
 		// be a scalar value only once this is no longer supported.
 		n.scheduleTask(handleExpr, env, x, id)
 
 	case *StructLit:
+		n.unshare()
 		n.scheduleStruct(env, x, id)
 
 	case *ListLit:
+		n.unshare()
+
+		// At this point we known we have at least an empty list.
+		n.updateCyclicStatusV3(id)
+
 		env := &Environment{
 			Up:     env,
 			Vertex: n.node,
@@ -163,8 +190,26 @@ func (n *nodeContext) scheduleConjunct(c Conjunct, id CloseInfo) {
 		n.scheduleTask(handleListLit, env, x, id)
 
 	case *DisjunctionExpr:
-		panic("unimplemented")
-		// n.addDisjunction(env, x, id)
+		n.unshare()
+		id := id
+		id.setOptionalV3(n)
+
+		// TODO(perf): reuse envDisjunct values so that we can also reuse the
+		// disjunct slice.
+		d := envDisjunct{
+			env:     env,
+			cloneID: id,
+			src:     x,
+			expr:    x,
+		}
+		for _, dv := range x.Values {
+			d.disjuncts = append(d.disjuncts, disjunct{
+				expr:      dv.Val,
+				isDefault: dv.Default,
+				mode:      mode(x.HasDefaults, dv.Default),
+			})
+		}
+		n.scheduleDisjunction(d)
 
 	case *Comprehension:
 		// always a partial comprehension.
@@ -174,6 +219,7 @@ func (n *nodeContext) scheduleConjunct(c Conjunct, id CloseInfo) {
 		n.scheduleTask(handleResolver, env, x, id)
 
 	case Evaluator:
+		n.unshare()
 		// Interpolation, UnaryExpr, CallExpr
 		n.scheduleTask(handleExpr, env, x, id)
 
@@ -190,7 +236,7 @@ func (n *nodeContext) scheduleConjunct(c Conjunct, id CloseInfo) {
 func (n *nodeContext) scheduleStruct(env *Environment,
 	s *StructLit,
 	ci CloseInfo) {
-	n.updateCyclicStatus(ci)
+	n.updateCyclicStatusV3(ci)
 
 	// NOTE: This is a crucial point in the code:
 	// Unification dereferencing happens here. The child nodes are set to
@@ -205,8 +251,10 @@ func (n *nodeContext) scheduleStruct(env *Environment,
 	hasEmbed := false
 	hasEllipsis := false
 
+	// TODO: do we still need this?
 	// shouldClose := ci.cc.isDef || ci.cc.isClosedOnce
-	// s.Init()
+
+	s.Init(n.ctx)
 
 	// TODO: do we still need to AddStruct and do we still need to Disable?
 	parent := n.node.AddStruct(s, childEnv, ci)
@@ -230,7 +278,18 @@ loop2:
 		case *Comprehension, Expr:
 			// No need to increment and decrement, as there will be at least
 			// one entry.
-			ci, _ = ci.spawnCloseContext(0)
+			if _, ok := s.Src.(*ast.File); !ok && s.Src != nil {
+				// If this is not a file, the struct indicates the scope/
+				// boundary at which closedness should apply. This is not true
+				// for files.
+				// We should also not spawn if this is a nested Comprehension,
+				// where the spawn is already done as it may lead to spurious
+				// field not allowed errors. We can detect this with a nil s.Src.
+				// TODO(evalv3): use a more principled detection mechanism.
+				// TODO: set this as a flag in StructLit so as to not have to
+				// do the somewhat dangerous cast here.
+				ci, _ = ci.spawnCloseContext(n.ctx, 0)
+			}
 			// Note: adding a count is not needed here, as there will be an
 			// embed spawn below.
 			hasEmbed = true
@@ -246,6 +305,11 @@ loop2:
 				n.aStruct = s
 				n.aStructID = ci
 			}
+			ci := ci
+			if x.ArcType == ArcOptional {
+				ci.setOptionalV3(n)
+			}
+
 			fc := MakeConjunct(childEnv, x, ci)
 			// fc.CloseInfo.cc = nil // TODO: should we add this?
 			n.insertArc(x.Label, x.ArcType, fc, ci, true)
@@ -255,8 +319,9 @@ loop2:
 			n.insertArc(x.Label, ArcMember, lc, ci, true)
 
 		case *Comprehension:
-			ci, cc := ci.spawnCloseContext(closeEmbed)
-			cc.incDependent(DEFER, nil)
+			ci, cc := ci.spawnCloseContext(n.ctx, closeEmbed)
+			cc.decl = x
+			cc.incDependent(n.ctx, DEFER, nil)
 			defer cc.decDependent(n.ctx, DEFER, nil)
 			n.insertComprehension(childEnv, x, ci)
 			hasEmbed = true
@@ -265,6 +330,7 @@ loop2:
 			// Can be added unconditionally to patterns.
 			ci.cc.isDef = false
 			ci.cc.isClosed = false
+			ci.cc.isDefOrig = false
 
 		case *DynamicField:
 			if x.ArcType == ArcMember {
@@ -274,16 +340,19 @@ loop2:
 			n.scheduleTask(handleDynamic, childEnv, x, ci)
 
 		case *BulkOptionalField:
+			ci := ci
+			ci.setOptionalV3(n)
 
 			// All do not depend on each other, so can be added at once.
 			n.scheduleTask(handlePatternConstraint, childEnv, x, ci)
 
 		case Expr:
 			// TODO: perhaps special case scalar Values to avoid creating embedding.
-			ci, cc := ci.spawnCloseContext(closeEmbed)
+			ci, cc := ci.spawnCloseContext(n.ctx, closeEmbed)
+			cc.decl = x
 
 			// TODO: do we need to increment here?
-			cc.incDependent(DEFER, nil) // decrement deferred below
+			cc.incDependent(n.ctx, DEFER, nil) // decrement deferred below
 			defer cc.decDependent(n.ctx, DEFER, nil)
 
 			ec := MakeConjunct(childEnv, x, ci)
@@ -292,7 +361,7 @@ loop2:
 		}
 	}
 	if hasEllipsis {
-		ci.cc.hasEllipsis = true
+		ci.cc.isTotal = true
 	}
 	if !hasEmbed {
 		n.aStruct = s
@@ -307,8 +376,13 @@ loop2:
 // scheduleVertexConjuncts injects the conjuncst of src n. If src was not fully
 // evaluated, it subscribes dst for future updates.
 func (n *nodeContext) scheduleVertexConjuncts(c Conjunct, arc *Vertex, closeInfo CloseInfo) {
-	// Don't add conjuncts if a node is referring to itself.
-	if n.node == arc {
+	// disjunctions, we need to dereference he underlying node.
+	if deref(n.node) == deref(arc) {
+		return
+	}
+
+	if n.shareIfPossible(c, arc, closeInfo) {
+		arc.getState(n.ctx)
 		return
 	}
 
@@ -344,37 +418,108 @@ func (n *nodeContext) scheduleVertexConjuncts(c Conjunct, arc *Vertex, closeInfo
 
 	if IsDef(c.Expr()) {
 		// TODO: or should we always insert the wrapper (for errors)?
-		ci, dc := closeInfo.spawnCloseContext(closeDef)
+		ci, dc := closeInfo.spawnCloseContext(n.ctx, closeDef)
 		closeInfo = ci
 
-		dc.incDependent(DEFER, nil) // decrement deferred below
+		dc.incDependent(n.ctx, DEFER, nil) // decrement deferred below
 		defer dc.decDependent(n.ctx, DEFER, nil)
 	}
 
-	if state := arc.getState(n.ctx); state != nil {
-		state.addNotify2(n.node, closeInfo)
+	if !n.node.nonRooted || n.node.IsDynamic {
+		if state := arc.getBareState(n.ctx); state != nil {
+			state.addNotify2(n.node, closeInfo)
+		}
 	}
 
+	// TODO(perf): buffer or use stack.
+	var a []*closeContext
+	a = appendPrefix(a, closeInfo.cc)
+
+	// Use explicit index in case Conjuncts grows during iteration.
 	for i := 0; i < len(arc.Conjuncts); i++ {
 		c := arc.Conjuncts[i]
+		n.insertAndSkipConjuncts(a, c, closeInfo)
+	}
 
-		// Note that we are resetting the tree here. We hereby assume that
-		// closedness conflicts resulting from unifying the referenced arc were
-		// already caught there and that we can ignore further errors here.
-		// c.CloseInfo = closeInfo
-
-		// We can use the original, but we know it will not be used
-
-		n.scheduleConjunct(c, closeInfo)
+	if state := arc.getBareState(n.ctx); state != nil {
+		n.toComplete = true
 	}
 }
 
-func (n *nodeContext) addNotify2(v *Vertex, c CloseInfo) []receiver {
-	n.completeNodeTasks()
+// appendPrefix records the closeContext from the root of the current node to
+// cc by walking up the parent chain and storing the results ancestor first.
+// This is used to split conjunct trees into a forest of little trees.
+func appendPrefix(a []*closeContext, cc *closeContext) []*closeContext {
+	if cc.parent != nil {
+		a = appendPrefix(a, cc.parent)
+	}
+	a = append(a, cc)
+	return a
+}
 
+// insertAndSkipConjuncts analyzes the conjunct tree represented by c and splits
+// it into branches from the point where it deviates from the conjunct branch
+// represented by skip.
+//
+// TODO(evalv3): Consider this example:
+//
+//	#A: {
+//		b: {} // error only reported here.
+//		c: b & {
+//			// error (g not allowed) not reported here, as it would be okay if b
+//			// were valid. Instead, it is reported at b only. This is conform
+//			// the spec.
+//			d: 1
+//		}
+//	}
+//	x: #A
+//	x: b: g: 1
+//
+// We could also report an error at g by tracing if a conjunct crosses a isDef
+// boundary between the root of c and the cc of the conjunct.
+// Not doing so might have an effect on the outcome of disjunctions. This may be
+// okay (ideally closedness is not modal), but something to consider. For now,
+// we should probably copy whatever v2 was doing.
+func (n *nodeContext) insertAndSkipConjuncts(skip []*closeContext, c Conjunct, id CloseInfo) {
+	if c.CloseInfo.cc == nil {
+		n.scheduleConjunct(c, id)
+		return
+	}
+
+	root := c.CloseInfo.cc.origin
+
+	// TODO(perf): closeContexts should be exact prefixes. So instead of
+	// searching the list, we could test them incrementally. This seems more
+	// robust for now as the data structure might slightly change and cause
+	// disalignment.
+	for _, s := range skip {
+		if root == s.origin {
+			switch x := c.Elem().(type) {
+			case *ConjunctGroup:
+				for _, c := range *x {
+					n.insertAndSkipConjuncts(skip, c, id)
+				}
+
+			default:
+				// TODO: do leaf conjuncts that match need different treatment
+				// from those that don't? Right now, we treat them the same.
+				n.scheduleConjunct(c, id)
+			}
+			return
+		}
+	}
+
+	n.scheduleConjunct(c, id)
+}
+
+func (n *nodeContext) addNotify2(v *Vertex, c CloseInfo) []receiver {
 	// No need to do the notification mechanism if we are already complete.
 	old := n.notify
-	if n.meets(allAncestorsProcessed) {
+	switch {
+	case n.node.isFinal():
+		return old
+	case !n.node.isInProgress():
+	case n.meets(allAncestorsProcessed):
 		return old
 	}
 
@@ -384,7 +529,7 @@ func (n *nodeContext) addNotify2(v *Vertex, c CloseInfo) []receiver {
 
 	// TODO: dedup: only add if t does not already exist. First check if this
 	// is even possible by adding a panic.
-	root := n.node.rootCloseContext()
+	root := n.node.rootCloseContext(n.ctx)
 	if root.isDecremented {
 		return old
 	}
@@ -397,9 +542,8 @@ func (n *nodeContext) addNotify2(v *Vertex, c CloseInfo) []receiver {
 
 	cc := c.cc
 
-	if root.linkNotify(v, cc, c.CycleInfo) {
+	if root.linkNotify(n.ctx, v, cc, c.CycleInfo) {
 		n.notify = append(n.notify, receiver{v, cc})
-		n.completeNodeTasks()
 	}
 
 	return old
@@ -408,26 +552,26 @@ func (n *nodeContext) addNotify2(v *Vertex, c CloseInfo) []receiver {
 // Literal conjuncts
 
 func (n *nodeContext) insertValueConjunct(env *Environment, v Value, id CloseInfo) {
-	n.updateCyclicStatus(id)
+	n.updateCyclicStatusV3(id)
 
 	ctx := n.ctx
 
 	switch x := v.(type) {
 	case *Vertex:
-		if m, ok := x.BaseValue.(*StructMarker); ok {
+		if x.ClosedNonRecursive {
+			n.node.ClosedNonRecursive = true
+			var cc *closeContext
+			id, cc = id.spawnCloseContext(n.ctx, 0)
+			cc.isClosedOnce = true
+
+			if v, ok := x.BaseValue.(*Vertex); ok {
+				n.insertValueConjunct(env, v, id)
+				return
+			}
+		}
+		if _, ok := x.BaseValue.(*StructMarker); ok {
 			n.aStruct = x
 			n.aStructID = id
-			if m.NeedClose {
-				// TODO: In the new evaluator this is used to mark a struct
-				// as closed in the debug output. Once the old evaluator is
-				// gone, we could simplify this.
-				id.IsClosed = true
-				if ctx.isDevVersion() {
-					var cc *closeContext
-					id, cc = id.spawnCloseContext(0)
-					cc.isClosedOnce = true
-				}
-			}
 		}
 
 		if !x.IsData() {
@@ -442,6 +586,8 @@ func (n *nodeContext) insertValueConjunct(env *Environment, v Value, id CloseInf
 			panic(fmt.Sprintf("invalid type %T", x.BaseValue))
 
 		case *ListMarker:
+			n.updateCyclicStatusV3(id)
+
 			// TODO: arguably we know now that the type _must_ be a list.
 			n.scheduleTask(handleListVertex, env, x, id)
 
@@ -482,9 +628,30 @@ func (n *nodeContext) insertValueConjunct(env *Environment, v Value, id CloseInf
 
 	switch x := v.(type) {
 	case *Disjunction:
-		n.addDisjunctionValue(env, x, id)
+		// TODO(perf): reuse envDisjunct values so that we can also reuse the
+		// disjunct slice.
+		id := id
+		id.setOptionalV3(n)
+
+		d := envDisjunct{
+			env:     env,
+			cloneID: id,
+			src:     x,
+			value:   x,
+		}
+		for i, dv := range x.Values {
+			d.disjuncts = append(d.disjuncts, disjunct{
+				expr:      dv,
+				isDefault: i < x.NumDefaults,
+				mode:      mode(x.HasDefaults, i < x.NumDefaults),
+			})
+		}
+		n.scheduleDisjunction(d)
 
 	case *Conjunction:
+		// TODO: consider sharing: conjunct could be `ref & ref`, for instance,
+		// in which case ref could still be shared.
+
 		for _, x := range x.Values {
 			n.insertValueConjunct(env, x, id)
 		}
@@ -532,7 +699,7 @@ func (n *nodeContext) insertValueConjunct(env *Environment, v Value, id CloseInf
 			k := 0
 			match := false
 			for _, c := range n.checks {
-				if y, ok := c.(*BoundValue); ok {
+				if y, ok := c.x.(*BoundValue); ok {
 					switch z := SimplifyBounds(ctx, n.kind, x, y); {
 					case z == y:
 						match = true
@@ -545,21 +712,42 @@ func (n *nodeContext) insertValueConjunct(env *Environment, v Value, id CloseInf
 			}
 			n.checks = n.checks[:k]
 			if !match {
-				n.checks = append(n.checks, x)
+				n.checks = append(n.checks, MakeConjunct(env, x, id))
 			}
 			return
 		}
 
 	case Validator:
 		// This check serves as simplifier, but also to remove duplicates.
+		cx := MakeConjunct(env, x, id)
 		for i, y := range n.checks {
-			if b := SimplifyValidator(ctx, x, y); b != nil {
+			if b, ok := SimplifyValidator(ctx, cx, y); ok {
 				n.checks[i] = b
 				return
 			}
 		}
-		n.updateNodeType(x.Kind(), x, id)
-		n.checks = append(n.checks, x)
+		kind := x.Kind()
+		n.updateNodeType(kind, x, id)
+		// A validator that is inserted in a closeContext should behave like top
+		// in the sense that the closeContext should not be closed if no other
+		// value is present that would erase top (cc.hasNonTop): if a field is
+		// only associated with a validator, we leave it to the validator to
+		// decide what fields are allowed.
+		if kind&(ListKind|StructKind) != 0 {
+			id.cc.hasTop = true
+		}
+		n.checks = append(n.checks, cx)
+
+		// We use set the type of the validator argument here to ensure that
+		// validation considers the ultimate value of embedded validators,
+		// rather than assuming that the struct in which an expression is
+		// embedded is always a struct.
+		// TODO(validatorType): get rid of setting n.hasTop here.
+		k := x.Kind()
+		if k == TopKind {
+			n.hasTop = true
+		}
+		n.updateNodeType(k, x, id)
 
 	case *Vertex:
 	// handled above.

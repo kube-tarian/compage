@@ -54,8 +54,6 @@ func (c *OpContext) Stats() *stats.Counts {
 // 	return e.NewContext(v)
 // }
 
-var structSentinel = &StructMarker{}
-
 var incompleteSentinel = &Bottom{
 	Code: IncompleteError,
 	Err:  errors.Newf(token.NoPos, "incomplete"),
@@ -83,7 +81,11 @@ func (c *OpContext) evaluate(v *Vertex, r Resolver, state combinedFlags) Value {
 				for ; v.Parent != nil && v.ArcType == ArcPending; v = v.Parent {
 				}
 				err := c.Newf("cycle with field %v", r)
-				b := &Bottom{Code: CycleError, Err: err}
+				b := &Bottom{
+					Code: CycleError,
+					Err:  err,
+					Node: v,
+				}
 				v.setValue(c, v.status, b)
 				return b
 				// TODO: use this instead, as is usual for incomplete errors,
@@ -99,6 +101,8 @@ func (c *OpContext) evaluate(v *Vertex, r Resolver, state combinedFlags) Value {
 	}
 
 	if n := v.state; n != nil {
+		n.assertInitialized()
+
 		if n.errs != nil && !n.errs.IsIncomplete() {
 			return n.errs
 		}
@@ -131,7 +135,7 @@ func (c *OpContext) evaluate(v *Vertex, r Resolver, state combinedFlags) Value {
 		return nil
 	}
 
-	if v.status < finalized && v.state != nil {
+	if v.status < finalized && v.state != nil && !c.isDevVersion() {
 		// TODO: errors are slightly better if we always add addNotify, but
 		// in this case it is less likely to cause a performance penalty.
 		// See https://cuelang.org/issue/661. It may be possible to
@@ -158,7 +162,7 @@ func (c *OpContext) unify(v *Vertex, flags combinedFlags) {
 	}
 
 	// defer c.PopVertex(c.PushVertex(v))
-	if Debug {
+	if c.LogEval > 0 {
 		c.nest++
 		c.Logf(v, "Unify")
 		defer func() {
@@ -192,17 +196,17 @@ func (c *OpContext) unify(v *Vertex, flags combinedFlags) {
 		return
 
 	case evaluatingArcs:
-		Assertf(v.status > 0, "unexpected status %d", v.status)
+		Assertf(c, v.status > unprocessed, "unexpected status %d", v.status)
 		return
 
 	case 0:
 		if v.Label.IsDef() {
-			v.Closed = true
+			v.ClosedRecursive = true
 		}
 
 		if v.Parent != nil {
-			if v.Parent.Closed {
-				v.Closed = true
+			if v.Parent.ClosedRecursive {
+				v.ClosedRecursive = true
 			}
 		}
 
@@ -351,7 +355,7 @@ func (c *OpContext) unify(v *Vertex, flags combinedFlags) {
 		// completing all disjunctions.
 		if !n.done() {
 			if err := n.incompleteErrors(true); err != nil {
-				b, _ := n.node.BaseValue.(*Bottom)
+				b := n.node.Bottom()
 				if b != err {
 					err = CombineErrors(n.ctx.src, b, err)
 				}
@@ -457,7 +461,7 @@ func (n *nodeContext) doNotify() {
 	for _, rec := range n.notify {
 		v := rec.v
 		if v.state == nil {
-			if b, ok := v.BaseValue.(*Bottom); ok {
+			if b := v.Bottom(); b != nil {
 				v.BaseValue = CombineErrors(nil, b, n.errs)
 			} else {
 				v.BaseValue = n.errs
@@ -599,7 +603,7 @@ func (n *nodeContext) postDisjunct(state vertexStatus) {
 //
 // Before it does this, it also checks whether n is of another incompatible
 // type, like struct. This prevents validators from being inadvertently set.
-// TODO: optimize this function for new implementation.
+// TODO(evalv3): optimize this function for new implementation.
 func (n *nodeContext) validateValue(state vertexStatus) {
 	ctx := n.ctx
 
@@ -610,9 +614,40 @@ func (n *nodeContext) validateValue(state vertexStatus) {
 	if n.aStruct != nil {
 		markStruct = true
 	} else if len(n.node.Structs) > 0 {
+		// TODO: do something more principled here.
+		// Here we collect evidence that a value is a struct. If a struct has
+		// an embedding, it may evaluate to an embedded scalar value, in which
+		// case it is not a struct. Right now this is tracked at the node level,
+		// but it really should be at the struct level. For instance:
+		//
+		// 		A: matchN(1, [>10])
+		// 		A: {
+		// 			if true {c: 1}
+		// 		}
+		//
+		// Here A is marked as Top by matchN. The other struct also has an
+		// embedding (the comprehension), and thus does not force it either.
+		// So the resulting kind is top, not struct.
+		// As an approximation, we at least mark the node as a struct if it has
+		// any regular fields.
 		markStruct = n.kind&StructKind != 0 && !n.hasTop
+		for _, a := range n.node.Arcs {
+			// TODO(spec): we generally allow optional fields alongside embedded
+			// scalars. We probably should not. Either way this is not entirely
+			// accurate, as a Pending arc may still be optional. We should
+			// collect the arcType noted in adt.Comprehension in a nodeContext
+			// as well so that we know what the potential arc of this node may
+			// be.
+			//
+			// TODO(evalv3): even better would be to ensure that all
+			// comprehensions are done before calling this.
+			if a.Label.IsRegular() && a.ArcType != ArcOptional {
+				markStruct = true
+				break
+			}
+		}
 	}
-	v := n.node.Value()
+	v := n.node.DerefValue().Value()
 	if n.node.BaseValue == nil && markStruct {
 		n.node.BaseValue = &StructMarker{}
 		v = n.node
@@ -622,7 +657,8 @@ func (n *nodeContext) validateValue(state vertexStatus) {
 		// serious errors and would like to know about all errors anyway.
 
 		if n.lowerBound != nil {
-			if b := ctx.Validate(n.lowerBound, v); b != nil {
+			c := MakeRootConjunct(nil, n.lowerBound)
+			if b := ctx.Validate(c, v); b != nil {
 				// TODO(errors): make Validate return boolean and generate
 				// optimized conflict message. Also track and inject IDs
 				// to determine origin location.s
@@ -634,7 +670,8 @@ func (n *nodeContext) validateValue(state vertexStatus) {
 			}
 		}
 		if n.upperBound != nil {
-			if b := ctx.Validate(n.upperBound, v); b != nil {
+			c := MakeRootConjunct(nil, n.upperBound)
+			if b := ctx.Validate(c, v); b != nil {
 				// TODO(errors): make Validate return boolean and generate
 				// optimized conflict message. Also track and inject IDs
 				// to determine origin location.s
@@ -654,6 +691,8 @@ func (n *nodeContext) validateValue(state vertexStatus) {
 // incompleteErrors reports all errors from uncompleted conjuncts.
 // If final is true, errors are permanent and reported to parents.
 func (n *nodeContext) incompleteErrors(final bool) *Bottom {
+	unreachableForDev(n.ctx)
+
 	// collect incomplete errors.
 	var err *Bottom // n.incomplete
 	for _, d := range n.dynamicFields {
@@ -682,6 +721,7 @@ func (n *nodeContext) incompleteErrors(final bool) *Bottom {
 		// n := d.node.getNodeContext(ctx)
 		// n.addBottom(err)
 		if final && c.vertex != nil && c.vertex.status != finalized {
+			c.vertex.state.assertInitialized()
 			c.vertex.state.addBottom(err)
 			c.vertex = nil
 		}
@@ -754,7 +794,7 @@ func (n *nodeContext) checkClosed(state vertexStatus) bool {
 	if !v.Label.IsInt() && v.Parent != nil && !ignore && v.ArcType <= ArcRequired {
 		ctx := n.ctx
 		// Visit arcs recursively to validate and compute error.
-		if _, err := verifyArc2(ctx, v.Label, v, v.Closed); err != nil {
+		if _, err := verifyArc2(ctx, v.Label, v, v.ClosedRecursive); err != nil {
 			// Record error in child node to allow recording multiple
 			// conflicts at the appropriate place, to allow valid fields to
 			// be represented normally and, most importantly, to avoid
@@ -819,8 +859,8 @@ func (n *nodeContext) completeArcs(state vertexStatus) {
 					state = conjuncts
 				}
 
-				if err, _ := a.BaseValue.(*Bottom); err != nil {
-					n.node.AddChildError(err)
+				if err := a.Bottom(); err != nil {
+					n.AddChildError(err)
 				}
 			}
 
@@ -845,7 +885,7 @@ func (n *nodeContext) completeArcs(state vertexStatus) {
 				// faulty CUE using this mechanism, though. At most error
 				// messages are a bit unintuitive. This may change once we have
 				// functionality to reflect on types.
-				if _, ok := n.node.BaseValue.(*Bottom); !ok {
+				if !n.node.IsErr() {
 					n.node.BaseValue = &StructMarker{}
 					n.kind = StructKind
 				}
@@ -869,6 +909,7 @@ func (n *nodeContext) completeArcs(state vertexStatus) {
 				n.node.AddErr(ctx, &Bottom{
 					Src:  c.expr.Source(),
 					Code: CycleError,
+					Node: n.node,
 					Err: ctx.NewPosf(pos(c.expr),
 						"circular dependency in evaluation of conditionals: %v changed after evaluation",
 						ctx.Str(c.expr)),
@@ -917,6 +958,10 @@ var cycle = &Bottom{
 }
 
 func isCyclePlaceholder(v BaseValue) bool {
+	// TODO: do not mark cycle in BaseValue.
+	if a, _ := v.(*Vertex); a != nil {
+		v = a.DerefValue().BaseValue
+	}
 	return v == cycle
 }
 
@@ -971,6 +1016,14 @@ type nodeContext struct {
 	// for source-level debuggers.
 	node *Vertex
 
+	// underlying is the original Vertex that this node overlays. It should be
+	// set for all Vertex values that were cloned.
+	underlying *Vertex
+
+	// overlays is set if this node is the root of a disjunct created in
+	// doDisjunct. It points to the direct parent nodeContext.
+	overlays *nodeContext
+
 	nodeContextState
 
 	scheduler
@@ -1000,11 +1053,27 @@ type nodeContext struct {
 	vLists []*Vertex
 	exprs  []envExpr
 
-	checks     []Validator // BuiltinValidator, other bound values.
-	postChecks []envCheck  // Check non-monotonic constraints, among other things.
+	// Checks is a list of conjuncts, as we need to preserve the context in
+	// which it was evaluated. The conjunct is always a validator (and thus
+	// a Value). We need to keep track of the CloseInfo, however, to be able
+	// to catch cycles when evaluating BuiltinValidators.
+	// TODO: introduce ValueConjunct to get better compile time type checking.
+	checks []Conjunct
+
+	postChecks []envCheck // Check non-monotonic constraints, among other things.
 
 	// Disjunction handling
 	disjunctions []envDisjunct
+
+	// disjunctCCs holds the close context that represent "holes" in which
+	// pending disjuncts are to be inserted for the clone represented by this
+	// nodeContext. Holes that are not yet filled will always need to be cloned
+	// when a disjunction branches in doDisjunct.
+	//
+	// Holes may accumulate as nested disjunctions get added and filled holes
+	// may be removed. So the list of disjunctCCs may differ from the number
+	// of disjunctions.
+	disjunctCCs []disjunctHole
 
 	// usedDefault indicates the for each of possibly multiple parent
 	// disjunctions whether it is unified with a default disjunct or not.
@@ -1012,9 +1081,12 @@ type nodeContext struct {
 	// be treated as a marked disjunction.
 	usedDefault []defaultInfo
 
+	// disjuncts holds disjuncts that evaluated to a non-bottom value.
+	// TODO: come up with a better name.
 	disjuncts    []*nodeContext
 	buffer       []*nodeContext
 	disjunctErrs []*Bottom
+	disjunct     Conjunct
 
 	// snapshot holds the last value of the vertex before calling postDisjunct.
 	snapshot Vertex
@@ -1035,11 +1107,45 @@ type conjunct struct {
 }
 
 type nodeContextState struct {
+	// isInitialized indicates whether conjuncts have been inserted in the node.
+	// Use node.isInitialized() to more generally check whether conjuncts have
+	// been processed.
+	isInitialized bool
+
+	// toComplete marks whether completeNodeTasks needs to be called on this
+	// node after a corresponding task has been completed.
+	toComplete bool
+
+	// isCompleting > 0 indicates whether a call to completeNodeTasks is in
+	// progress.
+	isCompleting int
+
+	// runMode keeps track of what runMode a disjunct should run as. This is
+	// relevant for nested disjunctions, like the 2|3 in (1 | (2|3)) & (1 | 2),
+	// where the nested disjunction should _not_ be considered as final, as
+	// there is still a disjunction at a higher level to be processed.
+	runMode runMode
+
+	// evalDept is a number that is assigned when evaluating arcs and is set to
+	// detect structural cycles. This value may be temporarily altered when a
+	// node descends into evaluating a value that may be an error (pattern
+	// constraints, optional fields, etc.). A non-zero value always indicates
+	// that there are cyclic references, though.
+	evalDepth int
+
 	// State info
 
-	hasTop      bool
-	hasCycle    bool // has conjunct with structural cycle
-	hasNonCycle bool // has conjunct without structural cycle
+	hasTop               bool
+	hasAnyCyclicConjunct bool // has conjunct with structural cycle
+	hasAncestorCycle     bool // has conjunct with structural cycle to an ancestor
+	hasNonCycle          bool // has material conjuncts without structural cycle
+	hasNonCyclic         bool // has non-cyclic conjuncts at start of field processing
+
+	isShared      bool      // set if we are currently structure sharing.
+	noSharing     bool      // set if structure sharing is not allowed
+	shared        Conjunct  // the original conjunct that led to sharing
+	sharedID      CloseInfo // the original CloseInfo that led to sharing
+	origBaseValue BaseValue // the BaseValue that structure sharing replaces.
 
 	depth       int32
 	defaultMode defaultMode
@@ -1075,8 +1181,6 @@ type nodeContextState struct {
 	// conjunctsPartialPos is like conjunctsPos, but for the 'partial' phase
 	// of processing where conjuncts are only processed as concrete scalars.
 	conjunctsPartialPos int
-
-	arcPos int
 }
 
 // A receiver receives notifications.
@@ -1169,6 +1273,7 @@ func (c *OpContext) newNodeContext(node *Vertex) *nodeContext {
 			vLists:             n.vLists[:0],
 			exprs:              n.exprs[:0],
 			disjunctions:       n.disjunctions[:0],
+			disjunctCCs:        n.disjunctCCs[:0],
 			usedDefault:        n.usedDefault[:0],
 			disjunctErrs:       n.disjunctErrs[:0],
 			disjuncts:          n.disjuncts[:0],
@@ -1176,6 +1281,7 @@ func (c *OpContext) newNodeContext(node *Vertex) *nodeContext {
 		}
 		n.scheduler.clear()
 		n.scheduler.node = n
+		n.underlying = node
 
 		return n
 	}
@@ -1190,6 +1296,7 @@ func (c *OpContext) newNodeContext(node *Vertex) *nodeContext {
 		nodeContextState: nodeContextState{kind: TopKind},
 	}
 	n.scheduler.node = n
+	n.underlying = node
 	return n
 }
 
@@ -1376,22 +1483,28 @@ func (n *nodeContext) finalDone() bool {
 // hasErr is used to determine if an evaluation path, for instance a single
 // path after expanding all disjunctions, has an error.
 func (n *nodeContext) hasErr() bool {
+	n.assertInitialized()
+
 	if n.node.ChildErrors != nil {
 		return true
 	}
-	if n.node.status > evaluating && n.node.IsErr() {
+	if n.node.Status() > evaluating && n.node.IsErr() {
 		return true
 	}
 	return n.ctx.HasErr() || n.errs != nil
 }
 
 func (n *nodeContext) getErr() *Bottom {
+	n.assertInitialized()
+
 	n.errs = CombineErrors(nil, n.errs, n.ctx.Err())
 	return n.errs
 }
 
 // getValidators sets the vertex' Value in case there was no concrete value.
 func (n *nodeContext) getValidators(state vertexStatus) BaseValue {
+	n.assertInitialized()
+
 	ctx := n.ctx
 
 	a := []Value{}
@@ -1409,7 +1522,7 @@ func (n *nodeContext) getValidators(state vertexStatus) BaseValue {
 	}
 	for _, c := range n.checks {
 		// Drop !=x if x is out of bounds with another bound.
-		if b, _ := c.(*BoundValue); b != nil && b.Op == NotEqualOp {
+		if b, _ := c.x.(*BoundValue); b != nil && b.Op == NotEqualOp {
 			if n.upperBound != nil &&
 				SimplifyBounds(ctx, n.kind, n.upperBound, b) != nil {
 				continue
@@ -1419,8 +1532,9 @@ func (n *nodeContext) getValidators(state vertexStatus) BaseValue {
 				continue
 			}
 		}
-		a = append(a, c)
-		kind &= c.Kind()
+		v := c.x.(Value)
+		a = append(a, v)
+		kind &= v.Kind()
 	}
 
 	if kind&^n.kind != 0 {
@@ -1434,7 +1548,7 @@ func (n *nodeContext) getValidators(state vertexStatus) BaseValue {
 	switch len(a) {
 	case 0:
 		// Src is the combined input.
-		if state >= conjuncts || n.kind&^CompositKind == 0 {
+		if state >= conjuncts || n.kind&^CompositeKind == 0 {
 			v = &BasicType{K: n.kind}
 		}
 
@@ -1482,7 +1596,6 @@ type envList struct {
 	id      CloseInfo
 	ignore  bool // has a self-referencing comprehension and is postponed
 	self    bool // was added as a postponed self-referencing comprehension
-	index   int
 }
 
 type envCheck struct {
@@ -1492,6 +1605,8 @@ type envCheck struct {
 }
 
 func (n *nodeContext) addBottom(b *Bottom) {
+	n.assertInitialized()
+
 	n.errs = CombineErrors(nil, n.errs, b)
 	// TODO(errors): consider doing this
 	// n.kindExpr = n.errs
@@ -1499,8 +1614,13 @@ func (n *nodeContext) addBottom(b *Bottom) {
 }
 
 func (n *nodeContext) addErr(err errors.Error) {
+	n.assertInitialized()
+
 	if err != nil {
-		n.addBottom(&Bottom{Err: err})
+		n.addBottom(&Bottom{
+			Err:  err,
+			Node: n.node,
+		})
 	}
 }
 
@@ -1722,7 +1842,7 @@ func (n *nodeContext) addVertexConjuncts(c Conjunct, arc *Vertex, inline bool) {
 		closeInfo = closeInfo.SpawnRef(arc, IsDef(x), x)
 	}
 
-	if arc.status == 0 && !inline {
+	if arc.status == unprocessed && !inline {
 		// This is a rare condition, but can happen in certain
 		// evaluation orders. Unfortunately, adding this breaks
 		// resolution of cyclic mutually referring disjunctions. But it
@@ -1880,8 +2000,9 @@ func (n *nodeContext) addValueConjunct(env *Environment, v Value, id CloseInfo) 
 			// This check serves as simplifier, but also to remove duplicates.
 			k := 0
 			match := false
+			cx := MakeConjunct(env, x, id)
 			for _, c := range n.checks {
-				if y, ok := c.(*BoundValue); ok {
+				if y, ok := c.x.(*BoundValue); ok {
 					switch z := SimplifyBounds(ctx, n.kind, x, y); {
 					case z == y:
 						match = true
@@ -1894,21 +2015,28 @@ func (n *nodeContext) addValueConjunct(env *Environment, v Value, id CloseInfo) 
 			}
 			n.checks = n.checks[:k]
 			if !match {
-				n.checks = append(n.checks, x)
+				n.checks = append(n.checks, cx)
 			}
 			return
 		}
 
 	case Validator:
 		// This check serves as simplifier, but also to remove duplicates.
+		cx := MakeConjunct(env, x, id)
 		for i, y := range n.checks {
-			if b := SimplifyValidator(ctx, x, y); b != nil {
+			if b, ok := SimplifyValidator(ctx, cx, y); ok {
 				n.checks[i] = b
 				return
 			}
 		}
 		n.updateNodeType(x.Kind(), x, id)
-		n.checks = append(n.checks, x)
+		n.checks = append(n.checks, cx)
+		// TODO(validatorType): see namesake TODO in conjunct.go.
+		k := x.Kind()
+		if k == TopKind {
+			n.hasTop = true
+		}
+		n.updateNodeType(k, x, id)
 
 	case *Vertex:
 	// handled above.
@@ -1985,7 +2113,7 @@ func (n *nodeContext) addStruct(
 		Vertex: n.node,
 	}
 
-	s.Init()
+	s.Init(n.ctx)
 
 	if s.HasEmbed && !s.IsFile() {
 		closeInfo = closeInfo.SpawnGroup(nil)
@@ -2025,6 +2153,7 @@ func (n *nodeContext) addStruct(
 			// TODO(perf): only do this if addExprConjunct below will result in
 			// a fieldSet. Otherwise the entry will just be removed next.
 			id := closeInfo.SpawnEmbed(x)
+			id.decl = x
 
 			c := MakeConjunct(childEnv, x, id)
 			n.addExprConjunct(c, partial)
@@ -2084,6 +2213,7 @@ func (n *nodeContext) insertField(f Feature, mode ArcType, x Conjunct) *Vertex {
 	default:
 		n.addBottom(&Bottom{
 			Code: IncompleteError,
+			Node: n.node,
 			Err: ctx.NewPosf(pos(x.Field()),
 				"cannot add field %s: was already used",
 				f.SelectorString(ctx)),
@@ -2124,7 +2254,7 @@ func (n *nodeContext) expandOne(state vertexStatus) (done bool) {
 	unreachableForDev(n.ctx)
 
 	// Don't expand incomplete expressions if we detected a cycle.
-	if n.done() || (n.hasCycle && !n.hasNonCycle) {
+	if n.done() || (n.hasAnyCyclicConjunct && !n.hasNonCycle) {
 		return false
 	}
 
@@ -2376,7 +2506,7 @@ outer:
 		s := l.list.info
 		if s == nil {
 			s = &StructLit{Decls: []Decl{l.elipsis}}
-			s.Init()
+			s.Init(n.ctx)
 			l.list.info = s
 		}
 		info := n.node.AddStruct(s, l.env, l.id)
@@ -2403,8 +2533,8 @@ outer:
 			IsOpen: isOpen,
 		})
 	} else {
-		if expr, _ := m.Src.(ast.Expr); expr != nil {
-			sources = append(sources, expr)
+		if m.Src != nil {
+			sources = append(sources, m.Src)
 		}
 		m.Src = ast.NewBinExpr(token.AND, sources...)
 		m.IsOpen = m.IsOpen && isOpen

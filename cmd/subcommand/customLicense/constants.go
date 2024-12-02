@@ -1,4 +1,4 @@
-package customLicense
+package customlicense
 
 const exampleCommand = `
 # Convert XML file to JSON and YAML with the file path provided in the command line

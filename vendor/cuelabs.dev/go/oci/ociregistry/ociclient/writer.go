@@ -82,7 +82,8 @@ func (c *client) MountBlob(ctx context.Context, fromRepo, toRepo string, dig oci
 		// return Unsupported.
 		return ociregistry.Descriptor{}, fmt.Errorf("registry does not support mounts: %w", ociregistry.ErrUnsupported)
 	}
-	return descriptorFromResponse(resp, dig, false)
+	// TODO: is it OK to omit the size from the returned descriptor here?
+	return descriptorFromResponse(resp, dig, requireDigest)
 }
 
 func (c *client) PushBlob(ctx context.Context, repo string, desc ociregistry.Descriptor, r io.Reader) (_ ociregistry.Descriptor, _err error) {

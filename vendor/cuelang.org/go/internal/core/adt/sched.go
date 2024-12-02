@@ -95,6 +95,9 @@ type taskContext struct {
 }
 
 func (p *taskContext) current() *task {
+	if len(p.stack) == 0 {
+		return nil
+	}
 	return p.stack[len(p.stack)-1]
 }
 
@@ -120,6 +123,7 @@ const (
 	taskWAITING // task is blocked on a property of an arc to hold
 	taskSUCCESS
 	taskFAILED
+	taskCANCELLED
 )
 
 type schedState uint8
@@ -172,6 +176,8 @@ func (s schedState) String() string {
 // runMode indicates how to proceed after a condition could not be met.
 type runMode uint8
 
+//go:generate go run golang.org/x/tools/cmd/stringer -type=runMode
+
 const (
 	// ignore indicates that the new evaluator should not do any processing.
 	// This is mostly used in the transition from old to new evaluator and
@@ -191,20 +197,6 @@ const (
 	// complete the evaluation of a Vertex.
 	finalize
 )
-
-func (r runMode) String() string {
-	switch r {
-	case ignore:
-		return "ignore"
-	case attemptOnly:
-		return "attemptOnly"
-	case yield:
-		return "yield"
-	case finalize:
-		return "finalize"
-	}
-	return "unknown"
-}
 
 // condition is a bit mask of states that a task may depend on.
 //
@@ -276,6 +268,17 @@ type scheduler struct {
 
 func (s *scheduler) clear() {
 	// TODO(perf): free tasks into task pool
+
+	// Any tasks blocked on this scheduler are unblocked once the scheduler is cleared.
+	// Otherwise they might signal a cleared scheduler, which can panic.
+	//
+	// TODO(mvdan,mpvl): In principle, all blocks should have been removed when a scheduler
+	// is cleared. Perhaps this can happen when the scheduler is stopped prematurely.
+	// For now, this solution seems to work OK.
+	for _, t := range s.blocking {
+		t.blockedOn = nil
+		t.blockCondition = neverKnown
+	}
 
 	*s = scheduler{
 		ctx:      s.ctx,
@@ -364,7 +367,7 @@ func (s *scheduler) process(needs condition, mode runMode) bool {
 		s.signal(f(s))
 	}
 
-	if Debug && len(s.tasks) > 0 {
+	if s.ctx.LogEval > 0 && len(s.tasks) > 0 {
 		if v := s.tasks[0].node.node; v != nil {
 			c.nest++
 			c.Logf(v, "START Process %v -- mode: %v", v.Label, mode)
@@ -450,7 +453,7 @@ unblockTasks:
 	// Run the remaining blocked tasks.
 	numBlocked := len(c.blocking)
 	for _, t := range c.blocking {
-		if t.blockedOn != nil {
+		if t.blockedOn != nil && !t.defunct {
 			n, cond := t.blockedOn, t.blockCondition
 			t.blockedOn, t.blockCondition = nil, neverKnown
 			n.signal(cond)
@@ -483,6 +486,8 @@ func (s *scheduler) yield() {
 
 // meets reports whether all needed completion states in s are met.
 func (s *scheduler) meets(needs condition) bool {
+	s.node.assertInitialized()
+
 	if s.state != schedREADY {
 		// Automatically qualify for conditions that are not provided by this node.
 		// NOTE: in the evaluator this is generally not the case, as tasks my still
@@ -561,12 +566,20 @@ type runner struct {
 	// needes indicates which states of the corresponding node need to be
 	// completed before this task can be run.
 	needs condition
+
+	// a lower priority indicates a preference to run a task before tasks
+	// of a higher priority.
+	priority int8
 }
 
 type task struct {
 	state taskState
 
 	completes condition // cycles may alter the completion mask. TODO: is this still true?
+
+	// defunct indicates that this task is no longer relevant. This is the case
+	// when it has not yet been run before it is copied into a disjunction.
+	defunct bool
 
 	// unblocked indicates this task was unblocked by force.
 	unblocked bool
@@ -575,6 +588,9 @@ type task struct {
 	// the scheduler, which conditions it is blocking on, and the stack of
 	// tasks executed leading to the block.
 
+	// blockedOn cannot be needed in a clone for a disjunct, because as long
+	// as the disjunct is unresolved, its value cannot contribute to another
+	// scheduler.
 	blockedOn      *scheduler
 	blockCondition condition
 	blockStack     []*task // TODO: use; for error reporting.
@@ -616,19 +632,40 @@ func (s *scheduler) insertTask(t *task) {
 	s.incrementCounts(completes)
 	if cc := t.id.cc; cc != nil {
 		// may be nil for "group" tasks, such as processLists.
-		dep := cc.incDependent(TASK, nil)
+		dep := cc.incDependent(t.node.ctx, TASK, nil)
 		if dep != nil {
 			dep.taskID = len(s.tasks)
 			dep.task = t
 		}
 	}
 	s.tasks = append(s.tasks, t)
+
+	// Sort by priority. This code is optimized for the case that there are
+	// very few tasks with higher priority. This loop will almost always
+	// terminate within 0 or 1 iterations.
+	for i := len(s.tasks) - 1; i > s.taskPos; i-- {
+		if s.tasks[i-1].run.priority <= s.tasks[i].run.priority {
+			break
+		}
+		s.tasks[i], s.tasks[i-1] = s.tasks[i-1], s.tasks[i]
+	}
+
 	if s.completed&needs != needs {
 		t.waitFor(s, needs)
 	}
 }
 
 func runTask(t *task, mode runMode) {
+	if t.defunct {
+		if t.state != taskCANCELLED {
+			t.state = taskCANCELLED
+			if t.id.cc != nil {
+				t.id.cc.decDependent(t.node.ctx, TASK, nil)
+			}
+		}
+		return
+	}
+	t.node.Logf("============ RUNTASK %v %v", t.run.name, t.x)
 	ctx := t.node.ctx
 
 	switch t.state {
@@ -639,6 +676,11 @@ func runTask(t *task, mode runMode) {
 	}
 
 	defer func() {
+		if n := t.node; n.toComplete {
+			n.toComplete = false
+			n.completeNodeTasks(attemptOnly)
+		}
+
 		switch r := recover().(type) {
 		case nil:
 		case *scheduler:
@@ -661,7 +703,10 @@ func runTask(t *task, mode runMode) {
 	defer ctx.popTask()
 	if t.env != nil {
 		id := t.id
-		id.cc = nil // this is done to avoid struct args from passing fields up.
+		// This is done to avoid struct args from passing fields up.
+		// Use [task.updateCI] to get the current CloseInfo with this field
+		// restored.
+		id.cc = nil
 		s := ctx.PushConjunct(MakeConjunct(t.env, t.x, id))
 		defer ctx.PopState(s)
 	}
@@ -692,6 +737,13 @@ func runTask(t *task, mode runMode) {
 		t.node.decrementCounts(t.completes)
 		t.completes = 0 // safety
 	}
+}
+
+// updateCI stitches back the closeContext that more removed from the CloseInfo
+// before in the given CloseInfo.
+func (t *task) updateCI(ci CloseInfo) CloseInfo {
+	ci.cc = t.id.cc
+	return ci
 }
 
 // waitFor blocks task t until the needs for scheduler s are met.

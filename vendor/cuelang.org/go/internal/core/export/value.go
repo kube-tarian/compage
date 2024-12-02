@@ -55,9 +55,10 @@ func (e *exporter) vertex(n *adt.Vertex) (result ast.Expr) {
 		e.popFrame(saved)
 	}()
 
-	for _, c := range n.Conjuncts {
+	n.VisitLeafConjuncts(func(c adt.Conjunct) bool {
 		e.markLets(c.Expr().Source(), s)
-	}
+		return true
+	})
 
 	switch x := n.BaseValue.(type) {
 	case nil:
@@ -85,7 +86,7 @@ func (e *exporter) vertex(n *adt.Vertex) (result ast.Expr) {
 				result = e.structComposite(n, attrs)
 			}
 
-		case !x.IsIncomplete() || len(n.Conjuncts) == 0 || e.cfg.Final:
+		case !x.IsIncomplete() || !n.HasConjuncts() || e.cfg.Final:
 			result = e.bottom(x)
 		}
 
@@ -102,11 +103,12 @@ func (e *exporter) vertex(n *adt.Vertex) (result ast.Expr) {
 	if result == nil {
 		// fall back to expression mode
 		a := []ast.Expr{}
-		for _, c := range n.Conjuncts {
+		n.VisitLeafConjuncts(func(c adt.Conjunct) bool {
 			if x := e.expr(c.Env, c.Elem()); x != dummyTop {
 				a = append(a, x)
 			}
-		}
+			return true
+		})
 		result = ast.NewBinExpr(token.AND, a...)
 	}
 
@@ -244,13 +246,15 @@ func (e *exporter) bool(n *adt.Bool) (b *ast.BasicLit) {
 	return ast.NewBool(n.B)
 }
 
-func extractBasic(a []adt.Conjunct) *ast.BasicLit {
-	for _, v := range a {
-		if b, ok := v.Source().(*ast.BasicLit); ok {
-			return &ast.BasicLit{Kind: b.Kind, Value: b.Value}
+func extractBasic(a []adt.Conjunct) (lit *ast.BasicLit) {
+	adt.VisitConjuncts(a, func(c adt.Conjunct) bool {
+		if b, ok := c.Source().(*ast.BasicLit); ok {
+			lit = &ast.BasicLit{Kind: b.Kind, Value: b.Value}
+			return false
 		}
-	}
-	return nil
+		return true
+	})
+	return lit
 }
 
 func (e *exporter) num(n *adt.Num, orig []adt.Conjunct) *ast.BasicLit {
@@ -431,7 +435,7 @@ func (e *exporter) structComposite(v *adt.Vertex, attrs []*ast.Attribute) ast.Ex
 			e.inDefinition++
 		}
 
-		arc := v.Lookup(label)
+		arc := v.LookupRaw(label)
 		if arc == nil {
 			continue
 		}
@@ -445,7 +449,7 @@ func (e *exporter) structComposite(v *adt.Vertex, attrs []*ast.Attribute) ast.Ex
 
 		internal.SetConstraint(f, arc.ArcType.Token())
 
-		f.Value = e.vertex(arc)
+		f.Value = e.vertex(arc.DerefValue())
 
 		if label.IsDef() {
 			e.inDefinition--

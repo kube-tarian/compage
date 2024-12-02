@@ -275,7 +275,7 @@ func (c *compiler) compileFiles(a []*ast.File) *adt.Vertex { // Or value?
 	// - anything in an anonymous file
 	//
 	for _, f := range a {
-		if p := internal.GetPackageInfo(f); p.IsAnonymous() {
+		if f.PackageName() == "" {
 			continue
 		}
 		for _, d := range f.Decls {
@@ -305,7 +305,7 @@ func (c *compiler) compileFiles(a []*ast.File) *adt.Vertex { // Or value?
 		c.pushScope(nil, 0, file) // File scope
 		v := &adt.StructLit{Src: file}
 		c.addDecls(v, file.Decls)
-		res.Conjuncts = append(res.Conjuncts, adt.MakeRootConjunct(env, v))
+		res.InsertConjunct(adt.MakeRootConjunct(env, v))
 		c.popScope()
 	}
 
@@ -1066,7 +1066,7 @@ func (c *compiler) parse(l *ast.BasicLit) (n adt.Expr) {
 	case token.STRING:
 		info, nStart, _, err := literal.ParseQuotes(s, s)
 		if err != nil {
-			return c.errf(l, err.Error())
+			return c.errf(l, "%s", err.Error())
 		}
 		s := s[nStart:]
 		return parseString(c, l, info, s)

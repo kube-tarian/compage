@@ -55,6 +55,9 @@ func makeError1(resp *http.Response, bodyData []byte) error {
 		// When we've made a HEAD request, we can't see any of
 		// the actual error, so we'll have to make up something
 		// from the HTTP status.
+		// TODO would we do better if we interpreted the HTTP status
+		// relative to the actual method that was called in order
+		// to come up with a more plausible error?
 		var err error
 		switch resp.StatusCode {
 		case http.StatusNotFound:
@@ -71,7 +74,7 @@ func makeError1(resp *http.Response, bodyData []byte) error {
 			// Our caller will turn this into a non-nil error.
 			return nil
 		}
-		return fmt.Errorf("error response: %v: %w", resp.Status, err)
+		return err
 	}
 	if ctype := resp.Header.Get("Content-Type"); !isJSONMediaType(ctype) {
 		return fmt.Errorf("non-JSON error response %q; body %q", ctype, bodyData)

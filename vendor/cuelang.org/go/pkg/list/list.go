@@ -17,6 +17,7 @@ package list
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 
 	"cuelang.org/go/cue"
@@ -24,6 +25,7 @@ import (
 	"cuelang.org/go/cue/token"
 	"cuelang.org/go/internal/core/adt"
 	"cuelang.org/go/internal/pkg"
+	"cuelang.org/go/internal/value"
 )
 
 // Drop reports the suffix of list x after the first n elements,
@@ -139,7 +141,7 @@ func Repeat(x []cue.Value, count int) ([]cue.Value, error) {
 		return nil, fmt.Errorf("negative count")
 	}
 	var a []cue.Value
-	for i := 0; i < count; i++ {
+	for range count {
 		a = append(a, x...)
 	}
 	return a, nil
@@ -215,6 +217,20 @@ func Slice(x []cue.Value, i, j int) ([]cue.Value, error) {
 	return x[i:j], nil
 }
 
+// Reverse reverses a list.
+//
+// For instance:
+//
+//	Reverse([1, 2, 3, 4])
+//
+// results in
+//
+//	[4, 3, 2, 1]
+func Reverse(x []cue.Value) []cue.Value {
+	slices.Reverse(x)
+	return x
+}
+
 // MinItems reports whether a has at least n items.
 func MinItems(list pkg.List, n int) (bool, error) {
 	count := len(list.Elems())
@@ -268,4 +284,34 @@ func Contains(a []cue.Value, v cue.Value) bool {
 		}
 	}
 	return false
+}
+
+// MatchN is a validator that checks that the number of elements in the given
+// list that unifies with the schema "matchValue" matches "n".
+// "n" may be a number constraint and does not have to be a concrete number.
+// Likewise, "matchValue" will usually be a non-concrete value.
+func MatchN(list []cue.Value, n pkg.Schema, matchValue pkg.Schema) (bool, error) {
+	var nmatch int64
+	for _, w := range list {
+		if matchValue.Unify(w).Validate() == nil {
+			nmatch++
+		}
+	}
+
+	r, _ := value.ToInternal(n)
+	ctx := (*cue.Context)(r)
+
+	if err := n.Unify(ctx.Encode(nmatch)).Validate(); err != nil {
+		return false, pkg.ValidationError{B: &adt.Bottom{
+			Code: adt.EvalError,
+			Err: errors.Newf(
+				token.NoPos,
+				"number of matched elements is %d: does not satisfy %v",
+				nmatch,
+				n,
+			),
+		}}
+	}
+
+	return true, nil
 }

@@ -20,8 +20,12 @@ package jsonschema
 
 import (
 	"fmt"
+	"math"
 	"net/url"
+	"regexp"
+	"regexp/syntax"
 	"sort"
+	"strconv"
 	"strings"
 
 	"cuelang.org/go/cue"
@@ -40,9 +44,14 @@ const rootDefs = "#"
 
 // A decoder converts JSON schema to CUE.
 type decoder struct {
-	cfg   *Config
-	errs  errors.Error
-	numID int // for creating unique numbers: increment on each use
+	cfg          *Config
+	errs         errors.Error
+	numID        int // for creating unique numbers: increment on each use
+	mapURLErrors map[string]bool
+	// self holds the struct literal that will eventually be embedded
+	// in the top level file. It is only set when decoder.rootRef is
+	// called.
+	self *ast.StructLit
 }
 
 // addImport registers
@@ -76,7 +85,11 @@ func (d *decoder) decode(v cue.Value) *ast.File {
 		if ref == nil {
 			return f
 		}
-		i, err := v.Lookup(ref...).Fields()
+		var selectors []cue.Selector
+		for _, r := range ref {
+			selectors = append(selectors, cue.Str(r))
+		}
+		i, err := v.LookupPath(cue.MakePath(selectors...)).Fields()
 		if err != nil {
 			d.errs = errors.Append(d.errs, errors.Promote(err, ""))
 			return nil
@@ -100,7 +113,11 @@ func (d *decoder) decode(v cue.Value) *ast.File {
 }
 
 func (d *decoder) schema(ref []ast.Label, v cue.Value) (a []ast.Decl) {
-	root := state{decoder: d}
+	root := state{
+		decoder:       d,
+		schemaVersion: d.cfg.DefaultVersion,
+		isRoot:        true,
+	}
 
 	var name ast.Label
 	inner := len(ref) - 1
@@ -110,11 +127,15 @@ func (d *decoder) schema(ref []ast.Label, v cue.Value) (a []ast.Decl) {
 		root.isSchema = true
 	}
 
-	expr, state := root.schemaState(v, allTypes, nil, false)
+	expr, state := root.schemaState(v, allTypes, nil)
+	if state.allowedTypes == 0 {
+		d.addErr(errors.Newf(state.pos.Pos(), "constraints are not possible to satisfy"))
+	}
 
 	tags := []string{}
-	if state.jsonschema != "" {
-		tags = append(tags, fmt.Sprintf("schema=%q", state.jsonschema))
+	if state.schemaVersionPresent {
+		// TODO use cue/literal.String
+		tags = append(tags, fmt.Sprintf("schema=%q", state.schemaVersion))
 	}
 
 	if name == nil {
@@ -144,14 +165,15 @@ func (d *decoder) schema(ref []ast.Label, v cue.Value) (a []ast.Decl) {
 		}
 
 		a = append(a, f)
-	} else if st, ok := expr.(*ast.StructLit); ok {
+	} else if st, ok := expr.(*ast.StructLit); ok && len(st.Elts) > 0 {
 		a = append(a, st.Elts...)
 	} else {
 		a = append(a, &ast.EmbedDecl{Expr: expr})
 	}
 
-	state.doc(a[0])
-
+	if len(a) > 0 {
+		state.doc(a[0])
+	}
 	for i := inner - 1; i >= 0; i-- {
 		a = []ast.Decl{&ast.Field{
 			Label: ref[i],
@@ -160,17 +182,35 @@ func (d *decoder) schema(ref []ast.Label, v cue.Value) (a []ast.Decl) {
 		expr = ast.NewStruct(ref[i], expr)
 	}
 
-	if root.hasSelfReference {
-		return []ast.Decl{
-			&ast.EmbedDecl{Expr: ast.NewIdent(topSchema)},
-			&ast.Field{
-				Label: ast.NewIdent(topSchema),
-				Value: &ast.StructLit{Elts: a},
-			},
-		}
+	if root.self == nil {
+		return a
 	}
+	root.self.Elts = a
+	return []ast.Decl{
+		&ast.EmbedDecl{Expr: d.rootRef()},
+		&ast.Field{
+			Label: d.rootRef(),
+			Value: root.self,
+		},
+	}
+}
 
-	return a
+// rootRef returns a reference to the top of the file. We do this by
+// creating a helper schema:
+//
+//	_schema: {...}
+//	_schema
+//
+// This is created at the finalization stage, signaled by d.self being
+// set, which rootRef does as a side-effect.
+func (d *decoder) rootRef() *ast.Ident {
+	ident := ast.NewIdent("_schema")
+	if d.self == nil {
+		d.self = &ast.StructLit{}
+	}
+	// Ensure that all self-references refer to the same node.
+	ident.Node = d.self
+	return ident
 }
 
 func (d *decoder) errf(n cue.Value, format string, args ...interface{}) ast.Expr {
@@ -190,16 +230,16 @@ func (d *decoder) number(n cue.Value) ast.Expr {
 	return n.Syntax(cue.Final()).(ast.Expr)
 }
 
-func (d *decoder) uint(n cue.Value) ast.Expr {
-	_, err := n.Uint64()
+func (d *decoder) uint(nv cue.Value) ast.Expr {
+	n, err := uint64Value(nv)
 	if err != nil {
-		d.errf(n, "invalid uint")
+		d.errf(nv, "invalid uint")
 	}
-	return n.Syntax(cue.Final()).(ast.Expr)
-}
-
-func (d *decoder) bool(n cue.Value) ast.Expr {
-	return n.Syntax(cue.Final()).(ast.Expr)
+	return &ast.BasicLit{
+		ValuePos: nv.Pos(),
+		Kind:     token.FLOAT,
+		Value:    strconv.FormatUint(n, 10),
+	}
 }
 
 func (d *decoder) boolValue(n cue.Value) bool {
@@ -223,6 +263,50 @@ func (d *decoder) strValue(n cue.Value) (s string, ok bool) {
 	return s, true
 }
 
+func (d *decoder) regexpValue(n cue.Value) (ast.Expr, bool) {
+	s, ok := d.strValue(n)
+	if !ok {
+		return nil, false
+	}
+	if !d.checkRegexp(n, s) {
+		return nil, false
+	}
+	return d.string(n), true
+}
+
+func (d *decoder) checkRegexp(n cue.Value, s string) bool {
+	_, err := syntax.Parse(s, syntax.Perl)
+	if err == nil {
+		return true
+	}
+	var regErr *syntax.Error
+	if errors.As(err, &regErr) {
+		switch regErr.Code {
+		case syntax.ErrInvalidPerlOp:
+			// It's Perl syntax that we'll never support because the CUE evaluation
+			// engine uses Go's regexp implementation and because the missing
+			// features are usually not there for good reason (e.g. exponential
+			// runtime). In other words, this is a missing feature but not an invalid
+			// regular expression as such.
+			if d.cfg.StrictFeatures {
+				d.errf(n, "unsupported Perl regexp syntax in %q: %v", s, err)
+			}
+			return false
+		case syntax.ErrInvalidCharRange:
+			// There are many more character class ranges than Go supports currently
+			// (see https://go.dev/issue/14509) so treat an unknown character class
+			// range as a feature error rather than a bad regexp.
+			// TODO translate names to Go-supported class names when possible.
+			if d.cfg.StrictFeatures {
+				d.errf(n, "unsupported regexp character class in %q: %v", s, err)
+			}
+			return false
+		}
+	}
+	d.errf(n, "invalid regexp %q: %v", s, err)
+	return false
+}
+
 // const draftCutoff = 5
 
 type coreType int
@@ -241,7 +325,7 @@ const (
 var coreToCUE = []cue.Kind{
 	nullType:   cue.NullKind,
 	boolType:   cue.BoolKind,
-	numType:    cue.FloatKind,
+	numType:    cue.NumberKind, // Note: both int and float.
 	stringType: cue.StringKind,
 	arrayType:  cue.ListKind,
 	objectType: cue.StructKind,
@@ -254,8 +338,12 @@ func kindToAST(k cue.Kind) ast.Expr {
 		return ast.NewNull()
 	case cue.BoolKind:
 		return ast.NewIdent("bool")
-	case cue.FloatKind:
+	case cue.NumberKind:
 		return ast.NewIdent("number")
+	case cue.IntKind:
+		return ast.NewIdent("int")
+	case cue.FloatKind:
+		return ast.NewIdent("float")
 	case cue.StringKind:
 		return ast.NewIdent("string")
 	case cue.ListKind:
@@ -263,7 +351,7 @@ func kindToAST(k cue.Kind) ast.Expr {
 	case cue.StructKind:
 		return ast.NewStruct(&ast.Ellipsis{})
 	}
-	return nil
+	panic(fmt.Errorf("unexpected kind %v", k))
 }
 
 var coreTypeName = []string{
@@ -301,6 +389,9 @@ func (s *state) add(n cue.Value, t coreType, x ast.Expr) {
 }
 
 func (s *state) setTypeUsed(n cue.Value, t coreType) {
+	if int(t) >= len(s.types) {
+		panic(fmt.Errorf("type out of range %v/%v", int(t), len(s.types)))
+	}
 	s.types[t].setTypeUsed(n, t)
 }
 
@@ -309,8 +400,7 @@ type state struct {
 
 	isSchema bool // for omitting ellipsis in an ast.File
 
-	up     *state
-	parent *state
+	up *state
 
 	path []string
 
@@ -324,8 +414,15 @@ type state struct {
 	all      constraintInfo // values and oneOf etc.
 	nullable *ast.BasicLit  // nullable
 
-	usedTypes    cue.Kind
+	// allowedTypes holds the set of types that
+	// this node is allowed to be.
 	allowedTypes cue.Kind
+
+	// knownTypes holds the set of types that this node
+	// is known to be one of by virtue of the constraints inside
+	// all. This is used to avoid adding redundant elements
+	// to the disjunction created by [state.finalize].
+	knownTypes cue.Kind
 
 	default_     ast.Expr
 	examples     []ast.Expr
@@ -334,14 +431,34 @@ type state struct {
 	deprecated   bool
 	exclusiveMin bool // For OpenAPI and legacy support.
 	exclusiveMax bool // For OpenAPI and legacy support.
-	jsonschema   string
-	id           *url.URL // base URI for $ref
+
+	// Keep track of whether a $ref keyword is present,
+	// because pre-2019-09 schemas ignore sibling keywords
+	// to $ref.
+	hasRefKeyword bool
+
+	// isRoot holds whether this state is at the root
+	// of the schema.
+	isRoot bool
+
+	minContains *uint64
+	maxContains *uint64
+
+	ifConstraint   cue.Value
+	thenConstraint cue.Value
+	elseConstraint cue.Value
+
+	schemaVersion        Version
+	schemaVersionPresent bool
+
+	id    *url.URL // base URI for $ref
+	idPos token.Pos
 
 	definitions []ast.Decl
 
 	// Used for inserting definitions, properties, etc.
-	hasSelfReference bool
-	obj              *ast.StructLit
+	obj  *ast.StructLit
+	objN cue.Value // used for adding obj to constraints
 	// Complete at finalize.
 	fieldRefs map[label]refs
 
@@ -349,6 +466,17 @@ type state struct {
 	patterns    []ast.Expr
 
 	list *ast.ListLit
+
+	// listItemsIsArray keeps track of whether the
+	// value of the "items" keyword is an array.
+	// Without this, we can't distinguish between
+	//
+	//	"items": true
+	//
+	// and
+	//
+	//	"items": []
+	listItemsIsArray bool
 }
 
 type label struct {
@@ -362,12 +490,41 @@ type refs struct {
 	refs  []*ast.Ident
 }
 
+func (s *state) idTag() *ast.Attribute {
+	return &ast.Attribute{
+		At:   s.idPos,
+		Text: fmt.Sprintf("@jsonschema(id=%q)", s.id)}
+}
+
 func (s *state) object(n cue.Value) *ast.StructLit {
 	if s.obj == nil {
 		s.obj = &ast.StructLit{}
-		s.add(n, objectType, s.obj)
+		s.objN = n
+
+		if s.id != nil {
+			s.obj.Elts = append(s.obj.Elts, s.idTag())
+		}
 	}
 	return s.obj
+}
+
+func (s *state) finalizeObject() {
+	if s.obj == nil {
+		return
+	}
+
+	var e ast.Expr
+	if s.closeStruct {
+		e = ast.NewCall(ast.NewIdent("close"), s.obj)
+	} else {
+		s.obj.Elts = append(s.obj.Elts, &ast.Ellipsis{})
+		e = s.obj
+	}
+
+	s.add(s.objN, objectType, e)
+	if s.id != nil && s.idPos.Before(s.objN.Pos()) {
+		ast.SetPos(e, s.idPos)
+	}
 }
 
 func (s *state) hasConstraints() bool {
@@ -382,7 +539,8 @@ func (s *state) hasConstraints() bool {
 	return len(s.patterns) > 0 ||
 		s.title != "" ||
 		s.description != "" ||
-		s.obj != nil
+		s.obj != nil ||
+		s.id != nil
 }
 
 const allTypes = cue.NullKind | cue.BoolKind | cue.NumberKind | cue.IntKind |
@@ -390,14 +548,16 @@ const allTypes = cue.NullKind | cue.BoolKind | cue.NumberKind | cue.IntKind |
 
 // finalize constructs a CUE type from the collected constraints.
 func (s *state) finalize() (e ast.Expr) {
+	if s.allowedTypes == 0 {
+		// Nothing is possible. This isn't a necessarily a problem, as
+		// we might be inside an allOf or oneOf with other valid constraints.
+		return bottom()
+	}
+
+	s.finalizeObject()
+
 	conjuncts := []ast.Expr{}
 	disjuncts := []ast.Expr{}
-
-	types := s.allowedTypes &^ s.usedTypes
-	if types == allTypes {
-		disjuncts = append(disjuncts, ast.NewIdent("_"))
-		types = 0
-	}
 
 	// Sort literal structs and list last for nicer formatting.
 	sort.SliceStable(s.types[arrayType].constraints, func(i, j int) bool {
@@ -409,59 +569,76 @@ func (s *state) finalize() (e ast.Expr) {
 		return !ok
 	})
 
-	for i, t := range s.types {
-		k := coreToCUE[i]
-		isAllowed := s.allowedTypes&k != 0
-		if len(t.constraints) > 0 {
-			if t.typ == nil && !isAllowed {
-				for _, c := range t.constraints {
-					s.addErr(errors.Newf(c.Pos(),
-						"constraint not allowed because type %s is excluded",
-						coreTypeName[i],
-					))
+	type excludeInfo struct {
+		pos      token.Pos
+		typIndex int
+	}
+	var excluded []excludeInfo
+
+	needsTypeDisjunction := s.allowedTypes != s.knownTypes
+	if !needsTypeDisjunction {
+		for i, t := range s.types {
+			k := coreToCUE[i]
+			if len(t.constraints) > 0 && s.allowedTypes&k != 0 {
+				// We need to include at least one type-specific
+				// constraint in the disjunction.
+				needsTypeDisjunction = true
+				break
+			}
+		}
+	}
+
+	if needsTypeDisjunction {
+		npossible := 0
+		nexcluded := 0
+		for i, t := range s.types {
+			k := coreToCUE[i]
+			allowed := s.allowedTypes&k != 0
+			switch {
+			case len(t.constraints) > 0:
+				npossible++
+				if !allowed {
+					nexcluded++
+					for _, c := range t.constraints {
+						excluded = append(excluded, excludeInfo{c.Pos(), i})
+					}
+					continue
 				}
-				continue
-			}
-			x := ast.NewBinExpr(token.AND, t.constraints...)
-			disjuncts = append(disjuncts, x)
-		} else if s.usedTypes&k != 0 {
-			continue
-		} else if t.typ != nil {
-			if !isAllowed {
-				s.addErr(errors.Newf(t.typ.Pos(),
-					"constraint not allowed because type %s is excluded",
-					coreTypeName[i],
-				))
-				continue
-			}
-			disjuncts = append(disjuncts, t.typ)
-		} else if types&k != 0 {
-			x := kindToAST(k)
-			if x != nil {
+				x := ast.NewBinExpr(token.AND, t.constraints...)
 				disjuncts = append(disjuncts, x)
+			case allowed:
+				npossible++
+				if s.knownTypes&k != 0 {
+					disjuncts = append(disjuncts, kindToAST(k))
+				}
+			}
+		}
+		if nexcluded == npossible {
+			// All possibilities have been excluded: this is an impossible
+			// schema.
+			for _, e := range excluded {
+				s.addErr(errors.Newf(e.pos,
+					"constraint not allowed because type %s is excluded",
+					coreTypeName[e.typIndex],
+				))
 			}
 		}
 	}
-
 	conjuncts = append(conjuncts, s.all.constraints...)
-
-	obj := s.obj
-	if obj == nil {
-		obj, _ = s.types[objectType].typ.(*ast.StructLit)
-	}
-	if obj != nil {
-		// TODO: may need to explicitly close.
-		if !s.closeStruct {
-			obj.Elts = append(obj.Elts, &ast.Ellipsis{})
-		}
-	}
 
 	if len(disjuncts) > 0 {
 		conjuncts = append(conjuncts, ast.NewBinExpr(token.OR, disjuncts...))
 	}
 
 	if len(conjuncts) == 0 {
-		e = &ast.BottomLit{}
+		// There are no conjuncts, which can only happen when there
+		// are no disjuncts, which can only happen when the entire
+		// set of disjuncts is redundant with respect to the types
+		// already implied by s.all. As we've already checked that
+		// s.allowedTypes is non-zero (so we know that
+		// it's not bottom) and we need _some_ expression
+		// to be part of the subequent syntax, we use top.
+		e = top()
 	} else {
 		e = ast.NewBinExpr(token.AND, conjuncts...)
 	}
@@ -477,7 +654,7 @@ outer:
 		// check conditions where default can be skipped.
 		switch x := s.default_.(type) {
 		case *ast.ListLit:
-			if s.usedTypes == cue.ListKind && len(x.Elts) == 0 {
+			if s.allowedTypes == cue.ListKind && len(x.Elts) == 0 {
 				break outer
 			}
 		}
@@ -499,12 +676,20 @@ outer:
 
 	s.linkReferences()
 
-	return e
-}
+	// If an "$id" exists and has not been included in any object constraints
+	if s.id != nil && s.obj == nil {
+		if st, ok := e.(*ast.StructLit); ok {
+			st.Elts = append([]ast.Decl{s.idTag()}, st.Elts...)
+		} else {
+			e = &ast.StructLit{Elts: []ast.Decl{s.idTag(), &ast.EmbedDecl{Expr: e}}}
+		}
+	}
 
-func isAny(s ast.Expr) bool {
-	i, ok := s.(*ast.Ident)
-	return ok && i.Name == "_"
+	// Now that we've expressed the schema as actual syntax,
+	// all the allowed types are actually explicit and will not
+	// need to be mentioned again.
+	s.knownTypes = s.allowedTypes
+	return e
 }
 
 func (s *state) comment() *ast.CommentGroup {
@@ -532,56 +717,98 @@ func (s *state) doc(n ast.Node) {
 }
 
 func (s *state) schema(n cue.Value, idRef ...label) ast.Expr {
-	expr, _ := s.schemaState(n, allTypes, idRef, false)
+	expr, _ := s.schemaState(n, allTypes, idRef)
 	// TODO: report unused doc.
 	return expr
 }
 
-// schemaState is a low-level API for schema. isLogical specifies whether the
-// caller is a logical operator like anyOf, allOf, oneOf, or not.
-func (s *state) schemaState(n cue.Value, types cue.Kind, idRef []label, isLogical bool) (ast.Expr, *state) {
-	state := &state{
-		up:           s,
-		isSchema:     s.isSchema,
-		decoder:      s.decoder,
-		allowedTypes: types,
-		path:         s.path,
-		idRef:        idRef,
-		pos:          n,
+// schemaState returns a new state value derived from s.
+// n holds the JSONSchema node to translate to a schema.
+// types holds the set of possible types that the value can hold.
+// idRef holds the path to the value.
+// isLogical specifies whether the caller is a logical operator like anyOf, allOf, oneOf, or not.
+func (s0 *state) schemaState(n cue.Value, types cue.Kind, idRef []label) (ast.Expr, *state) {
+	s := &state{
+		up:            s0,
+		schemaVersion: s0.schemaVersion,
+		isSchema:      s0.isSchema,
+		decoder:       s0.decoder,
+		allowedTypes:  types,
+		knownTypes:    allTypes,
+		idRef:         idRef,
+		pos:           n,
+		isRoot:        s0.isRoot && n == s0.pos,
 	}
-	if isLogical {
-		state.parent = s
+	if n.Kind() == cue.BoolKind {
+		if vfrom(VersionDraft6).contains(s.schemaVersion) {
+			// From draft6 onwards, boolean values signify a schema that always passes or fails.
+			return boolSchema(s.boolValue(n)), s
+		}
+		return s.errf(n, "boolean schemas not supported in %v", s.schemaVersion), s
 	}
-
 	if n.Kind() != cue.StructKind {
-		return s.errf(n, "schema expects mapping node, found %s", n.Kind()), state
+		return s.errf(n, "schema expects mapping node, found %s", n.Kind()), s
 	}
 
 	// do multiple passes over the constraints to ensure they are done in order.
-	for pass := 0; pass < 4; pass++ {
-		state.processMap(n, func(key string, value cue.Value) {
+	for pass := 0; pass < numPhases; pass++ {
+		s.processMap(n, func(key string, value cue.Value) {
+			if pass == 0 && key == "$ref" {
+				// Before 2019-19, keywords alongside $ref are ignored so keep
+				// track of whether we've seen any non-$ref keywords so we can
+				// ignore those keywords. This could apply even when the schema
+				// is >=2019-19 because $schema could be used to change the version.
+				s.hasRefKeyword = true
+			}
+			if strings.HasPrefix(key, "x-") {
+				// A keyword starting with a leading x- is clearly
+				// not intended to be a valid keyword, and is explicitly
+				// allowed by OpenAPI. It seems reasonable that
+				// this is not an error even with StrictKeywords enabled.
+				return
+			}
 			// Convert each constraint into a either a value or a functor.
 			c := constraintMap[key]
 			if c == nil {
-				if pass == 0 && s.cfg.Strict {
+				if pass == 0 && s.cfg.StrictKeywords {
 					// TODO: value is not the correct position, albeit close. Fix this.
-					s.warnf(value.Pos(), "unsupported constraint %q", key)
+					s.warnf(value.Pos(), "unknown keyword %q", key)
 				}
 				return
 			}
-			if c.phase == pass {
-				c.fn(value, state)
+			if c.phase != pass {
+				return
 			}
+			if !c.versions.contains(s.schemaVersion) {
+				if s.cfg.StrictKeywords {
+					s.warnf(value.Pos(), "keyword %q is not supported in JSON schema version %v", key, s.schemaVersion)
+				}
+				return
+			}
+			if pass > 0 && !vfrom(VersionDraft2019_09).contains(s.schemaVersion) && s.hasRefKeyword && key != "$ref" {
+				// We're using a schema version that ignores keywords alongside $ref.
+				//
+				// Note that we specifically exclude pass 0 (the pass in which $schema is checked)
+				// from this check, because hasRefKeyword is only set in pass 0 and we
+				// can get into a self-contradictory situation ($schema says we should
+				// ignore keywords alongside $ref, but $ref says we should ignore the $schema
+				// keyword itself). We could make that situation an explicit error, but other
+				// implementations don't, and it would require an entire extra pass just to do so.
+				if s.cfg.StrictKeywords {
+					s.warnf(value.Pos(), "ignoring keyword %q alongside $ref", key)
+				}
+				return
+			}
+			c.fn(key, value, s)
 		})
 	}
+	constraintIfThenElse(s)
 
-	return state.finalize(), state
+	return s.finalize(), s
 }
 
 func (s *state) value(n cue.Value) ast.Expr {
 	k := n.Kind()
-	s.usedTypes |= k
-	s.allowedTypes &= k
 	switch k {
 	case cue.ListKind:
 		a := []ast.Expr{}
@@ -598,8 +825,6 @@ func (s *state) value(n cue.Value) ast.Expr {
 				Value: s.value(n),
 			})
 		})
-		// TODO: only open when s.isSchema?
-		a = append(a, &ast.Ellipsis{})
 		return setPos(&ast.StructLit{Elts: a}, n)
 
 	default:
@@ -616,14 +841,10 @@ func (s *state) value(n cue.Value) ast.Expr {
 // This may also prevent exponential blow-up (as may happen when
 // converting YAML to JSON).
 func (s *state) processMap(n cue.Value, f func(key string, n cue.Value)) {
-	saved := s.path
-	defer func() { s.path = saved }()
 
 	// TODO: intercept references to allow for optimized performance.
 	for i, _ := n.Fields(); i.Next(); {
-		key := i.Label()
-		s.path = append(saved, key)
-		f(key, i.Value())
+		f(i.Label(), i.Value())
 	}
 }
 
@@ -640,21 +861,27 @@ func (s *state) listItems(name string, n cue.Value, allowEmpty bool) (a []cue.Va
 	return a
 }
 
-// excludeFields returns a CUE expression that can be used to exclude the
+// excludeFields returns either an empty slice (if decls is empty)
+// or a slice containing a CUE expression that can be used to exclude the
 // fields of the given declaration in a label expression. For instance, for
 //
 //	{ foo: 1, bar: int }
 //
-// it creates
+// it creates a slice holding the expression
 //
-//	"^(foo|bar)$"
+//	!~ "^(foo|bar)$"
 //
 // which can be used in a label expression to define types for all fields but
 // those existing:
 //
 //	[!~"^(foo|bar)$"]: string
-func excludeFields(decls []ast.Decl) ast.Expr {
-	var a []string
+func excludeFields(decls []ast.Decl) []ast.Expr {
+	if len(decls) == 0 {
+		return nil
+	}
+	var buf strings.Builder
+	first := true
+	buf.WriteString("^(")
 	for _, d := range decls {
 		f, ok := d.(*ast.Field)
 		if !ok {
@@ -662,17 +889,43 @@ func excludeFields(decls []ast.Decl) ast.Expr {
 		}
 		str, _, _ := ast.LabelName(f.Label)
 		if str != "" {
-			a = append(a, str)
+			if !first {
+				buf.WriteByte('|')
+			}
+			buf.WriteString(regexp.QuoteMeta(str))
+			first = false
 		}
 	}
-	re := fmt.Sprintf("^(%s)$", strings.Join(a, "|"))
-	return &ast.UnaryExpr{Op: token.NMAT, X: ast.NewString(re)}
+	buf.WriteString(")$")
+	return []ast.Expr{
+		&ast.UnaryExpr{Op: token.NMAT, X: ast.NewString(buf.String())},
+	}
+}
+
+func bottom() ast.Expr {
+	return &ast.BottomLit{}
+}
+
+func top() ast.Expr {
+	return ast.NewIdent("_")
+}
+
+func boolSchema(ok bool) ast.Expr {
+	if ok {
+		return top()
+	}
+	return bottom()
+}
+
+func isAny(s ast.Expr) bool {
+	i, ok := s.(*ast.Ident)
+	return ok && i.Name == "_"
 }
 
 func addTag(field ast.Label, tag, value string) *ast.Field {
 	return &ast.Field{
 		Label: field,
-		Value: ast.NewIdent("_"),
+		Value: top(),
 		Attrs: []*ast.Attribute{
 			{Text: fmt.Sprintf("@%s(%s)", tag, value)},
 		},
@@ -682,4 +935,26 @@ func addTag(field ast.Label, tag, value string) *ast.Field {
 func setPos(e ast.Expr, v cue.Value) ast.Expr {
 	ast.SetPos(e, v.Pos())
 	return e
+}
+
+// uint64Value is like v.Uint64 except that it
+// also allows floating point constants, as long
+// as they have no fractional part.
+func uint64Value(v cue.Value) (uint64, error) {
+	n, err := v.Uint64()
+	if err == nil {
+		return n, nil
+	}
+	f, err := v.Float64()
+	if err != nil {
+		return 0, err
+	}
+	intPart, fracPart := math.Modf(f)
+	if fracPart != 0 {
+		return 0, errors.Newf(v.Pos(), "%v is not a whole number", v)
+	}
+	if intPart < 0 || intPart > math.MaxUint64 {
+		return 0, errors.Newf(v.Pos(), "%v is out of bounds", v)
+	}
+	return uint64(intPart), nil
 }

@@ -26,7 +26,6 @@ import (
 	"cuelang.org/go/cue/errors"
 	"cuelang.org/go/cue/parser"
 	"cuelang.org/go/cue/token"
-	"cuelang.org/go/internal"
 )
 
 // An Instance describes the collection of files, and its imports, necessary
@@ -91,14 +90,7 @@ type Instance struct {
 	// ancestor directories, up to the module file.
 	Dir string
 
-	// NOTICE: the below tags may change in the future.
-
-	// ImportComment is the path in the import comment on the package statement.
-	ImportComment string `api:"alpha"`
-
-	// AllTags are the build tags that can influence file selection in this
-	// directory.
-	AllTags []string `api:"alpha"`
+	// NOTICE: the below struct field tags may change in the future.
 
 	// Incomplete reports whether any dependencies had an error.
 	Incomplete bool `api:"alpha"`
@@ -239,9 +231,9 @@ func (inst *Instance) AddSyntax(file *ast.File) errors.Error {
 	astutil.Resolve(file, func(pos token.Pos, msg string, args ...interface{}) {
 		inst.Err = errors.Append(inst.Err, errors.Newf(pos, msg, args...))
 	})
-	_, pkg, pos := internal.PackageInfo(file)
-	if pkg != "" && pkg != "_" && !inst.setPkg(pkg) && pkg != inst.PkgName {
-		err := errors.Newf(pos,
+	pkg := file.PackageName()
+	if pkg != "" && pkg != "_" && !inst.User && !inst.setPkg(pkg) && pkg != inst.PkgName {
+		err := errors.Newf(file.Pos(),
 			"package name %q conflicts with previous package name %q",
 			pkg, inst.PkgName)
 		inst.ReportError(err)

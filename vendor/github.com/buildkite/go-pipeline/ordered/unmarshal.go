@@ -169,9 +169,9 @@ func Unmarshal(src, dst any) error {
 				x := reflect.New(etype) // *E
 				err := Unmarshal(a, x.Interface())
 				if w := warning.As(err); w != nil {
-					warns = append(warns, w.Wrapf("while unmarshaling item %d of %d", i, len(tsrc)))
+					warns = append(warns, w.Wrapf("while unmarshaling item at index %d of %d", i, len(tsrc)))
 				} else if err != nil {
-					return err
+					return fmt.Errorf("unmarshaling item at index %d of %d: %w", i, len(tsrc), err)
 				}
 				sdst = reflect.Append(sdst, x.Elem())
 			}
@@ -282,7 +282,7 @@ func (m *Map[K, V]) decodeInto(target any) error {
 			if w := warning.As(err); w != nil {
 				warns = append(warns, w.Wrapf("while unmarshaling value for key %q", k))
 			} else if err != nil {
-				return err
+				return fmt.Errorf("unmarshaling value for key %q: %w", k, err)
 			}
 
 			innerValue.SetMapIndex(reflect.ValueOf(k), nv.Elem())
@@ -431,7 +431,7 @@ func (m *Map[K, V]) UnmarshalOrdered(src any) error {
 		if w := warning.As(err); w != nil {
 			warns = append(warns, w.Wrapf("while unmarshaling the value for key %q", k))
 		} else if err != nil {
-			return err
+			return fmt.Errorf("unmarshaling value for key %q: %w", k, err)
 		}
 		tm.Set(k, dv)
 		return nil
