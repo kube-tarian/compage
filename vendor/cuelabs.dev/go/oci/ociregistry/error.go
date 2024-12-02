@@ -15,14 +15,32 @@
 package ociregistry
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"unicode"
 )
+
+var errorStatuses = map[string]int{
+	ErrBlobUnknown.Code():         http.StatusNotFound,
+	ErrBlobUploadInvalid.Code():   http.StatusRequestedRangeNotSatisfiable,
+	ErrBlobUploadUnknown.Code():   http.StatusNotFound,
+	ErrDigestInvalid.Code():       http.StatusBadRequest,
+	ErrManifestBlobUnknown.Code(): http.StatusNotFound,
+	ErrManifestInvalid.Code():     http.StatusBadRequest,
+	ErrManifestUnknown.Code():     http.StatusNotFound,
+	ErrNameInvalid.Code():         http.StatusBadRequest,
+	ErrNameUnknown.Code():         http.StatusNotFound,
+	ErrSizeInvalid.Code():         http.StatusBadRequest,
+	ErrUnauthorized.Code():        http.StatusUnauthorized,
+	ErrDenied.Code():              http.StatusForbidden,
+	ErrUnsupported.Code():         http.StatusBadRequest,
+	ErrTooManyRequests.Code():     http.StatusTooManyRequests,
+	ErrRangeInvalid.Code():        http.StatusRequestedRangeNotSatisfiable,
+}
 
 // WireErrors is the JSON format used for error responses in
 // the OCI HTTP API. It should always contain at least one
@@ -70,26 +88,18 @@ func (e *WireError) Is(err error) bool {
 
 // Error implements the [error] interface.
 func (e *WireError) Error() string {
-	var buf strings.Builder
-	for _, r := range e.Code_ {
-		if r == '_' {
-			buf.WriteByte(' ')
-		} else {
-			buf.WriteRune(unicode.ToLower(r))
-		}
-	}
-	if buf.Len() == 0 {
-		buf.WriteString("(no code)")
-	}
+	buf := make([]byte, 0, 128)
+	buf = appendErrorCodePrefix(buf, e.Code_)
+
 	if e.Message != "" {
-		buf.WriteString(": ")
-		buf.WriteString(e.Message)
+		buf = append(buf, ": "...)
+		buf = append(buf, e.Message...)
 	}
-	if len(e.Detail_) != 0 && !bytes.Equal(e.Detail_, []byte("null")) {
-		buf.WriteString("; detail: ")
-		buf.Write(e.Detail_)
-	}
-	return buf.String()
+	// TODO: it would be nice to have some way to surface the detail
+	// in a message, but it's awkward to do so here because we don't
+	// really want the detail to be duplicated in the "message"
+	// and "detail" fields.
+	return string(buf)
 }
 
 // Code implements [Error.Code].
@@ -198,16 +208,14 @@ func (e *httpError) Is(err error) bool {
 
 // Error implements [error.Error].
 func (e *httpError) Error() string {
-	var buf strings.Builder
-	buf.WriteString(strconv.Itoa(e.statusCode))
-	buf.WriteString(" ")
-	buf.WriteString(http.StatusText(e.statusCode))
+	buf := make([]byte, 0, 128)
+	buf = appendHTTPStatusPrefix(buf, e.statusCode)
 	if e.underlying != nil {
-		buf.WriteString(": ")
-		buf.WriteString(e.underlying.Error())
+		buf = append(buf, ": "...)
+		buf = append(buf, e.underlying.Error()...)
 	}
 	// TODO if underlying is nil, include some portion of e.body in the message?
-	return buf.String()
+	return string(buf)
 }
 
 // StatusCode implements [HTTPError.StatusCode].
@@ -223,6 +231,89 @@ func (e *httpError) Response() *http.Response {
 // ResponseBody implements [HTTPError.ResponseBody].
 func (e *httpError) ResponseBody() []byte {
 	return e.body
+}
+
+// WriteError marshals the given error as JSON using [MarshalError] and
+// then writes it to w. It returns the error returned from w.Write.
+func WriteError(w http.ResponseWriter, err error) error {
+	data, httpStatus := MarshalError(err)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatus)
+	_, err = w.Write(data)
+	return err
+}
+
+// MarshalError marshals the given error as JSON according
+// to the OCI distribution specification. It also returns
+// the associated HTTP status code, or [http.StatusInternalServerError]
+// if no specific code can be found.
+//
+// If err is or wraps [Error], that code will be used for the "code"
+// field in the marshaled error.
+//
+// If err wraps [HTTPError] and no HTTP status code is known
+// for the error code, [HTTPError.StatusCode] will be used.
+func MarshalError(err error) (errorBody []byte, httpStatus int) {
+	var e WireError
+	// TODO perhaps we should iterate through all the
+	// errors instead of just choosing one.
+	// See https://github.com/golang/go/issues/66455
+	var ociErr Error
+	if errors.As(err, &ociErr) {
+		e.Code_ = ociErr.Code()
+		e.Detail_ = ociErr.Detail()
+	}
+	if e.Code_ == "" {
+		// This is contrary to spec, but it's what the Docker registry
+		// does, so it can't be too bad.
+		e.Code_ = "UNKNOWN"
+	}
+	// Use the HTTP status code from the error only when there isn't
+	// one implied from the error code. This means that the HTTP status
+	// is always consistent with the error code, but still allows a registry
+	// to choose custom HTTP status codes for other codes.
+	httpStatus = http.StatusInternalServerError
+	if status, ok := errorStatuses[e.Code_]; ok {
+		httpStatus = status
+	} else {
+		var httpErr HTTPError
+		if errors.As(err, &httpErr) {
+			httpStatus = httpErr.StatusCode()
+		}
+	}
+	// Prevent the message from containing a redundant
+	// error code prefix by stripping it before sending over the
+	// wire. This won't always work, but is enough to prevent
+	// adjacent stuttering of code prefixes when a client
+	// creates a WireError from an error response.
+	e.Message = trimErrorCodePrefix(err, httpStatus, e.Code_)
+	data, err := json.Marshal(WireErrors{
+		Errors: []WireError{e},
+	})
+	if err != nil {
+		panic(fmt.Errorf("cannot marshal error: %v", err))
+	}
+	return data, httpStatus
+}
+
+// trimErrorCodePrefix returns err's string
+// with any prefix codes added by [HTTPError]
+// or [WireError] removed.
+func trimErrorCodePrefix(err error, httpStatus int, errorCode string) string {
+	msg := err.Error()
+	buf := make([]byte, 0, 128)
+	if httpStatus != 0 {
+		buf = appendHTTPStatusPrefix(buf, httpStatus)
+		buf = append(buf, ": "...)
+		msg = strings.TrimPrefix(msg, string(buf))
+	}
+	if errorCode != "" {
+		buf = buf[:0]
+		buf = appendErrorCodePrefix(buf, errorCode)
+		buf = append(buf, ": "...)
+		msg = strings.TrimPrefix(msg, string(buf))
+	}
+	return msg
 }
 
 // The following values represent the known error codes.
@@ -251,6 +342,27 @@ var (
 	// We borrowed RANGE_INVALID from the Docker registry implementation, a de facto standard.
 	ErrRangeInvalid = NewError("invalid content range", "RANGE_INVALID", nil)
 )
+
+func appendHTTPStatusPrefix(buf []byte, statusCode int) []byte {
+	buf = strconv.AppendInt(buf, int64(statusCode), 10)
+	buf = append(buf, ' ')
+	buf = append(buf, http.StatusText(statusCode)...)
+	return buf
+}
+
+func appendErrorCodePrefix(buf []byte, code string) []byte {
+	if code == "" {
+		return append(buf, "(no code)"...)
+	}
+	for _, r := range code {
+		if r == '_' {
+			buf = append(buf, ' ')
+		} else {
+			buf = append(buf, string(unicode.ToLower(r))...)
+		}
+	}
+	return buf
+}
 
 func ref[T any](x T) *T {
 	return &x

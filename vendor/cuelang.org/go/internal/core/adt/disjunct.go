@@ -15,6 +15,8 @@
 package adt
 
 import (
+	"slices"
+
 	"cuelang.org/go/cue/errors"
 	"cuelang.org/go/cue/token"
 )
@@ -83,8 +85,16 @@ import (
 //     - So only need to check exact labels for vertices.
 
 type envDisjunct struct {
-	env         *Environment
-	cloneID     CloseInfo
+	env     *Environment
+	cloneID CloseInfo
+
+	// fields for new evaluator
+
+	src       Node
+	disjuncts []disjunct
+
+	// fields for old evaluator
+
 	expr        *DisjunctionExpr
 	value       *Disjunction
 	hasDefaults bool
@@ -108,13 +118,21 @@ func (n *nodeContext) addDisjunction(env *Environment, x *DisjunctionExpr, clone
 		}
 	}
 
-	n.disjunctions = append(n.disjunctions,
-		envDisjunct{env, cloneID, x, nil, numDefaults > 0, false, false})
+	n.disjunctions = append(n.disjunctions, envDisjunct{
+		env:         env,
+		cloneID:     cloneID,
+		expr:        x,
+		hasDefaults: numDefaults > 0,
+	})
 }
 
 func (n *nodeContext) addDisjunctionValue(env *Environment, x *Disjunction, cloneID CloseInfo) {
-	n.disjunctions = append(n.disjunctions,
-		envDisjunct{env, cloneID, nil, x, x.HasDefaults, false, false})
+	n.disjunctions = append(n.disjunctions, envDisjunct{
+		env:         env,
+		cloneID:     cloneID,
+		value:       x,
+		hasDefaults: x.HasDefaults,
+	})
 
 }
 
@@ -192,7 +210,7 @@ func (n *nodeContext) expandDisjuncts(
 			n.disjuncts = append(n.disjuncts, n)
 		}
 		if n.node.BaseValue == nil {
-			n.node.BaseValue = n.getValidators(state)
+			n.setBaseValue(n.getValidators(state))
 		}
 
 		n.usedDefault = append(n.usedDefault, defaultInfo{
@@ -344,7 +362,7 @@ func (n *nodeContext) expandDisjuncts(
 					m = combineDefault(m, info.nestedMode)
 
 				case hasDefaults && !used:
-					Assertf(parent == notDefault, "unexpected default mode")
+					Assertf(n.ctx, parent == notDefault, "unexpected default mode")
 				}
 			}
 			d.defaultMode = m
@@ -451,6 +469,7 @@ func (n *nodeContext) makeError() {
 	b := &Bottom{
 		Code: code,
 		Err:  n.disjunctError(),
+		Node: n.node,
 	}
 	n.node.SetValue(n.ctx, b)
 }
@@ -486,12 +505,10 @@ func clone(v Vertex) Vertex {
 			case finalized:
 				v.Arcs[i] = arc
 
-			case 0:
+			case unprocessed:
 				a := *arc
 				v.Arcs[i] = &a
-
-				a.Conjuncts = make([]Conjunct, len(arc.Conjuncts))
-				copy(a.Conjuncts, arc.Conjuncts)
+				a.Conjuncts = slices.Clone(arc.Conjuncts)
 
 			default:
 				a := *arc
@@ -504,8 +521,7 @@ func clone(v Vertex) Vertex {
 	}
 
 	if a := v.Structs; len(a) > 0 {
-		v.Structs = make([]*StructInfo, len(a))
-		copy(v.Structs, a)
+		v.Structs = slices.Clone(a)
 	}
 
 	return v

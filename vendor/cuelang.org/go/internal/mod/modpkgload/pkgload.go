@@ -3,6 +3,7 @@ package modpkgload
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"runtime"
 	"slices"
 	"sort"
@@ -76,14 +77,15 @@ func (f Flags) has(cond Flags) bool {
 }
 
 type Packages struct {
-	mainModuleVersion module.Version
-	mainModuleLoc     module.SourceLoc
-	pkgCache          par.Cache[string, *Package]
-	pkgs              []*Package
-	rootPkgs          []*Package
-	work              *par.Queue
-	requirements      *modrequirements.Requirements
-	registry          Registry
+	mainModuleVersion    module.Version
+	mainModuleLoc        module.SourceLoc
+	shouldIncludePkgFile func(pkgPath string, mod module.Version, fsys fs.FS, mf modimports.ModuleFile) bool
+	pkgCache             par.Cache[string, *Package]
+	pkgs                 []*Package
+	rootPkgs             []*Package
+	work                 *par.Queue
+	requirements         *modrequirements.Requirements
+	registry             Registry
 }
 
 type Package struct {
@@ -146,6 +148,14 @@ func (pkg *Package) Mod() module.Version {
 // packages they import, recursively, using modules from the given
 // requirements to determine which modules they might be obtained from,
 // and reg to download module contents.
+//
+// rootPkgPaths should only contain canonical import paths.
+//
+// The shouldIncludePkgFile function is used to determine whether a
+// given file in a package should be considered to be part of the build.
+// If it returns true for a package, the file's imports will be followed.
+// A nil value corresponds to a function that always returns true.
+// It may be called concurrently.
 func LoadPackages(
 	ctx context.Context,
 	mainModulePath string,
@@ -153,13 +163,15 @@ func LoadPackages(
 	rs *modrequirements.Requirements,
 	reg Registry,
 	rootPkgPaths []string,
+	shouldIncludePkgFile func(pkgPath string, mod module.Version, fsys fs.FS, mf modimports.ModuleFile) bool,
 ) *Packages {
 	pkgs := &Packages{
-		mainModuleVersion: module.MustNewVersion(mainModulePath, ""),
-		mainModuleLoc:     mainModuleLoc,
-		requirements:      rs,
-		registry:          reg,
-		work:              par.NewQueue(runtime.GOMAXPROCS(0)),
+		mainModuleVersion:    module.MustNewVersion(mainModulePath, ""),
+		mainModuleLoc:        mainModuleLoc,
+		shouldIncludePkgFile: shouldIncludePkgFile,
+		requirements:         rs,
+		registry:             reg,
+		work:                 par.NewQueue(runtime.GOMAXPROCS(0)),
 	}
 	inRoots := map[*Package]bool{}
 	pkgs.rootPkgs = make([]*Package, 0, len(rootPkgPaths))
@@ -210,8 +222,9 @@ func (pkgs *Packages) All() []*Package {
 	return slices.Clip(pkgs.pkgs)
 }
 
-func (pkgs *Packages) Pkg(pkgPath string) *Package {
-	pkg, _ := pkgs.pkgCache.Get(pkgPath)
+// Pkg obtains a given package given its canonical import path.
+func (pkgs *Packages) Pkg(canonicalPkgPath string) *Package {
+	pkg, _ := pkgs.pkgCache.Get(canonicalPkgPath)
 	return pkg
 }
 
@@ -220,14 +233,14 @@ func (pkgs *Packages) addPkg(ctx context.Context, pkgPath string, flags Flags) *
 		pkg := &Package{
 			path: pkgPath,
 		}
-		pkgs.applyPkgFlags(ctx, pkg, flags)
+		pkgs.applyPkgFlags(pkg, flags)
 
 		pkgs.work.Add(func() { pkgs.load(ctx, pkg) })
 		return pkg
 	})
 
 	// Ensure the flags apply even if the package already existed.
-	pkgs.applyPkgFlags(ctx, pkg, flags)
+	pkgs.applyPkgFlags(pkg, flags)
 	return pkg
 }
 
@@ -242,12 +255,41 @@ func (pkgs *Packages) load(ctx context.Context, pkg *Package) {
 		return
 	}
 	if pkgs.mainModuleVersion.Path() == pkg.mod.Path() {
-		pkgs.applyPkgFlags(ctx, pkg, PkgInAll)
+		pkgs.applyPkgFlags(pkg, PkgInAll)
 	}
-	pkgQual := module.ParseImportPath(pkg.path).Qualifier
+	ip := module.ParseImportPath(pkg.path)
+	pkgQual := ip.Qualifier
+	if pkgQual == "" {
+		pkg.err = fmt.Errorf("cannot determine package name from import path %q", pkg.path)
+		return
+	}
+	if pkgQual == "_" {
+		pkg.err = fmt.Errorf("_ is not a valid import path qualifier in %q", pkg.path)
+		return
+	}
 	importsMap := make(map[string]bool)
+	foundPackageFile := false
+	excludedPackageFiles := 0
 	for _, loc := range pkg.locs {
-		imports, err := modimports.AllImports(modimports.PackageFiles(loc.FS, loc.Dir, pkgQual))
+		// Layer an iterator whose yield function keeps track of whether we have seen
+		// a single valid CUE file in the package directory.
+		// Otherwise we would have to iterate twice, causing twice as many io/fs operations.
+		pkgFileIter := func(yield func(modimports.ModuleFile, error) bool) {
+			modimports.PackageFiles(loc.FS, loc.Dir, pkgQual)(func(mf modimports.ModuleFile, err error) bool {
+				if err != nil {
+					return yield(mf, err)
+				}
+				ip1 := ip
+				ip1.Qualifier = mf.Syntax.PackageName()
+				if !pkgs.shouldIncludePkgFile(ip1.String(), pkg.mod, loc.FS, mf) {
+					excludedPackageFiles++
+					return true
+				}
+				foundPackageFile = true
+				return yield(mf, err)
+			})
+		}
+		imports, err := modimports.AllImports(pkgFileIter)
 		if err != nil {
 			pkg.err = fmt.Errorf("cannot get imports: %v", err)
 			return
@@ -255,6 +297,14 @@ func (pkgs *Packages) load(ctx context.Context, pkg *Package) {
 		for _, imp := range imports {
 			importsMap[imp] = true
 		}
+	}
+	if !foundPackageFile {
+		if excludedPackageFiles > 0 {
+			pkg.err = fmt.Errorf("no files in package directory with package name %q (%d files were excluded)", pkgQual, excludedPackageFiles)
+		} else {
+			pkg.err = fmt.Errorf("no files in package directory with package name %q", pkgQual)
+		}
+		return
 	}
 	imports := make([]string, 0, len(importsMap))
 	for imp := range importsMap {
@@ -270,13 +320,13 @@ func (pkgs *Packages) load(ctx context.Context, pkg *Package) {
 	for _, path := range imports {
 		pkg.imports = append(pkg.imports, pkgs.addPkg(ctx, path, importFlags))
 	}
-	pkgs.applyPkgFlags(ctx, pkg, PkgImportsLoaded)
+	pkgs.applyPkgFlags(pkg, PkgImportsLoaded)
 }
 
 // applyPkgFlags updates pkg.flags to set the given flags and propagate the
 // (transitive) effects of those flags, possibly loading or enqueueing further
 // packages as a result.
-func (pkgs *Packages) applyPkgFlags(ctx context.Context, pkg *Package, flags Flags) {
+func (pkgs *Packages) applyPkgFlags(pkg *Package, flags Flags) {
 	if flags == 0 {
 		return
 	}
@@ -302,13 +352,13 @@ func (pkgs *Packages) applyPkgFlags(ctx context.Context, pkg *Package, flags Fla
 		// We have just marked pkg with pkgInAll, or we have just loaded its
 		// imports, or both. Now is the time to propagate pkgInAll to the imports.
 		for _, dep := range pkg.imports {
-			pkgs.applyPkgFlags(ctx, dep, PkgInAll)
+			pkgs.applyPkgFlags(dep, PkgInAll)
 		}
 	}
 
 	if new.has(PkgFromRoot) && !old.has(PkgFromRoot|PkgImportsLoaded) {
 		for _, dep := range pkg.imports {
-			pkgs.applyPkgFlags(ctx, dep, PkgFromRoot)
+			pkgs.applyPkgFlags(dep, PkgFromRoot)
 		}
 	}
 }

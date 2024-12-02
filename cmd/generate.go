@@ -23,13 +23,13 @@ Change the file as per your needs and then run the compage generate command to g
 	Run: func(cmd *cobra.Command, args []string) {
 		wD, err := os.Getwd()
 		if err != nil {
-			log.Errorf("error while getting the current directory [" + err.Error() + "]")
+			log.Errorf("error while getting the current directory: %v", err)
 			return
 		}
 		// set the project directory environment variable, if this is set, then the project will be generated in this folder
 		err = os.Setenv("COMPAGE_GENERATED_PROJECT_DIRECTORY", wD)
 		if err != nil {
-			log.Errorf("error while setting the project directory [" + err.Error() + "]")
+			log.Errorf("error while setting the project directory: %v", err)
 			return
 		}
 
@@ -59,7 +59,7 @@ func GenerateCode() error {
 	// converts to core project
 	coreProject, err := cmd.GetProject(project)
 	if err != nil {
-		log.Errorf("error while converting request to project [" + err.Error() + "]")
+		log.Errorf("error while converting request to project: %v", err)
 		return err
 	}
 
@@ -70,13 +70,13 @@ func GenerateCode() error {
 			// convert the license data to byte array
 			licenseData, err1 := json.Marshal(l)
 			if err1 != nil {
-				log.Errorf("error while marshalling license data [" + err1.Error() + "]")
+				log.Errorf("error while marshalling license data: %v", err1)
 				return err1
 			}
 			// convert the license data to license struct
 			err1 = json.Unmarshal(licenseData, license)
 			if err1 != nil {
-				log.Errorf("error while unmarshalling license data [" + err1.Error() + "]")
+				log.Errorf("error while unmarshalling license data: %v", err1)
 				return err1
 			}
 			// assign absolute path to the license file Path if it's not set
@@ -84,7 +84,7 @@ func GenerateCode() error {
 				// assign absolute path to the license file Path if it's not
 				absPath, err2 := filepath.Abs(license.Path)
 				if err2 != nil {
-					log.Errorf("error while getting absolute path [" + err2.Error() + "]")
+					log.Errorf("error while getting absolute path: %v", err2)
 					return err2
 				}
 				license.Path = absPath
@@ -103,13 +103,13 @@ func GenerateCode() error {
 			// convert the license data to byte array
 			licenseData, err1 := json.Marshal(l)
 			if err1 != nil {
-				log.Errorf("error while marshalling license data [" + err1.Error() + "]")
+				log.Errorf("error while marshalling license data: %v", err1)
 				return err1
 			}
 			// convert the license data to license struct
 			err1 = json.Unmarshal(licenseData, license)
 			if err1 != nil {
-				log.Errorf("error while unmarshalling license data [" + err1.Error() + "]")
+				log.Errorf("error while unmarshalling license data: %v", err1)
 				return err1
 			}
 			// assign absolute path to the license file Path if it's not set
@@ -117,7 +117,7 @@ func GenerateCode() error {
 				// assign absolute path to the license file Path if it's not
 				absPath, err2 := filepath.Abs(license.Path)
 				if err2 != nil {
-					log.Errorf("error while getting absolute path [" + err2.Error() + "]")
+					log.Errorf("error while getting absolute path: %v", err2)
 					return err2
 				}
 				license.Path = absPath
@@ -130,14 +130,14 @@ func GenerateCode() error {
 	// pull the common templates
 	err = ociregistry.PullOCIArtifact("common", project.CompageCoreVersion)
 	if err != nil {
-		log.Errorf("error while pulling the common templates [" + err.Error() + "]")
+		log.Errorf("error while pulling the common templates: %v", err)
 		return err
 	}
 	for _, node := range coreProject.CompageJSON.Nodes {
 		// make sure that the latest template is pulled
 		err = ociregistry.PullOCIArtifact(node.Language, project.CompageCoreVersion)
 		if err != nil {
-			log.Errorf("error while pulling the template [" + err.Error() + "]")
+			log.Errorf("error while pulling the template: %v", err)
 			return err
 		}
 		log.Debugf("template pulled successfully for language %s", node.Language)
@@ -146,7 +146,7 @@ func GenerateCode() error {
 	// triggers project generation, process the request
 	err0 := handlers.Handle(coreProject)
 	if err0 != nil {
-		log.Errorf("error while generating the project [" + err0.Error() + "]")
+		log.Errorf("error while generating the project: %v", err0)
 		return err
 	}
 	log.Infof("project generated successfully at %s", utils.GetProjectDirectoryName(project.Name))

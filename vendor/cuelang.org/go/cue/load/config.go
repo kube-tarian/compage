@@ -16,10 +16,10 @@ package load
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"cuelang.org/go/cue/ast"
 	"cuelang.org/go/cue/build"
@@ -128,14 +128,21 @@ type Config struct {
 	// Context specifies the context for the load operation.
 	Context *build.Context
 
-	// A Module is a collection of packages and instances that are within the
-	// directory hierarchy rooted at the module root. The module root can be
-	// marked with a cue.mod file.
+	// ModuleRoot is the directory that contains the cue.mod directory
+	// as well as all the packages which form part of the module being loaded.
+	//
+	// If left as the empty string, a module root is found by walking parent directories
+	// starting from [Config.Dir] until one is found containing a cue.mod directory.
+	// If it is a relative path, it will be interpreted relative to [Config.Dir].
 	ModuleRoot string
 
 	// Module specifies the module prefix. If not empty, this value must match
 	// the module field of an existing cue.mod file.
 	Module string
+
+	// AcceptLegacyModules causes the module resolution code
+	// to accept module files that lack a language.version field.
+	AcceptLegacyModules bool
 
 	// modFile holds the contents of the module file, or nil
 	// if no module file was present. If non-nil, then
@@ -242,18 +249,16 @@ type Config struct {
 	// a package.
 	Tools bool
 
-	// filesMode indicates that files are specified
-	// explicitly on the command line.
-	filesMode bool
+	// SkipImports causes the loading to ignore all imports and dependencies.
+	// The registry will never be consulted. Any external package paths
+	// mentioned on the command line will result in an error.
+	// The [cue/build.Instance.Imports] field will be empty.
+	SkipImports bool
 
 	// If DataFiles is set, the loader includes entries for directories that
 	// have no CUE files, but have recognized data files that could be converted
 	// to CUE.
 	DataFiles bool
-
-	// StdRoot specifies an alternative directory for standard libraries.
-	// This is mostly used for bootstrapping.
-	StdRoot string
 
 	// ParseFile is called to read and parse each file when preparing a
 	// package's syntax tree. It must be safe to call ParseFile simultaneously
@@ -279,13 +284,13 @@ type Config struct {
 
 	// Registry is used to fetch CUE module dependencies.
 	//
-	// When nil, if the modules experiment is enabled
-	// (CUE_EXPERIMENT=modules), [modconfig.NewRegistry]
-	// will be used to create a registry instance using the
-	// usual cmd/cue conventions for environment variables
-	// (but see the Env field below).
+	// When nil, [modconfig.NewRegistry] will be used to create a
+	// registry instance using the variables set in [Config.Env]
+	// as documented in `[cue help registryconfig]`.
 	//
 	// THIS IS EXPERIMENTAL. API MIGHT CHANGE.
+	//
+	// [cue help registryconfig]: https://cuelang.org/docs/reference/command/cue-help-registryconfig/
 	Registry modconfig.Registry
 
 	// Env provides environment variables for use in the configuration.
@@ -294,7 +299,7 @@ type Config struct {
 	// will be used.
 	Env []string
 
-	fileSystem fileSystem
+	fileSystem *fileSystem
 }
 
 func (c *Config) stdin() io.Reader {
@@ -306,27 +311,19 @@ func (c *Config) stdin() io.Reader {
 
 type importPath string
 
-type fsPath string
-
-func addImportQualifier(pkg importPath, name string) (importPath, errors.Error) {
-	if name != "" {
-		s := string(pkg)
-		if i := strings.LastIndexByte(s, '/'); i >= 0 {
-			s = s[i+1:]
-		}
-		if i := strings.LastIndexByte(s, ':'); i >= 0 {
-			// should never happen, but just in case.
-			s = s[i+1:]
-			if s != name {
-				return "", errors.Newf(token.NoPos,
-					"non-matching package names (%s != %s)", s, name)
-			}
-		} else if s != name {
-			pkg += importPath(":" + name)
-		}
+func addImportQualifier(pkg importPath, name string) (importPath, error) {
+	if name == "" {
+		return pkg, nil
 	}
-
-	return pkg, nil
+	ip := module.ParseImportPath(string(pkg))
+	if ip.Qualifier == "_" {
+		return "", fmt.Errorf("invalid import qualifier _ in %q", pkg)
+	}
+	if ip.ExplicitQualifier && ip.Qualifier != name {
+		return "", fmt.Errorf("non-matching package names (%s != %s)", ip.Qualifier, name)
+	}
+	ip.Qualifier = name
+	return importPath(ip.String()), nil
 }
 
 // Complete updates the configuration information. After calling complete,
@@ -359,36 +356,48 @@ func (c Config) complete() (cfg *Config, err error) {
 
 	// TODO: we could populate this already with absolute file paths,
 	// but relative paths cannot be added. Consider what is reasonable.
-	if err := c.fileSystem.init(c.Dir, c.Overlay); err != nil {
+	fsys, err := newFileSystem(&c)
+	if err != nil {
 		return nil, err
 	}
+	c.fileSystem = fsys
 
 	// TODO: determine root on a package basis. Maybe we even need a
 	// pkgname.cue.mod
 	// Look to see if there is a cue.mod.
+	//
+	// TODO(mvdan): note that setting Config.ModuleRoot to a directory
+	// without a cue.mod file does not result in any error, which is confusing
+	// or can lead to not using the right CUE module silently.
 	if c.ModuleRoot == "" {
 		// Only consider the current directory by default
 		c.ModuleRoot = c.Dir
-		if root := c.findRoot(c.Dir); root != "" {
+		if root := c.findModRoot(c.Dir); root != "" {
 			c.ModuleRoot = root
 		}
 	} else if !filepath.IsAbs(c.ModuleRoot) {
 		c.ModuleRoot = filepath.Join(c.Dir, c.ModuleRoot)
 	}
-	// Note: if cueexperiment.Flags.Modules _isn't_ set but c.Registry
-	// is, we consider that a good enough hint that modules support
-	// should be enabled and hence don't return an error in that case.
-	if cueexperiment.Flags.Modules && c.Registry == nil {
-		registry, err := modconfig.NewRegistry(&modconfig.Config{
-			Env: c.Env,
-		})
-		if err != nil {
-			// If there's an error in the registry configuration,
-			// don't error immediately, but only when we actually
-			// need to resolve modules.
-			registry = errorRegistry{err}
+	if c.SkipImports {
+		// We should never use the registry in SkipImports mode
+		// but nil it out to be sure.
+		c.Registry = nil
+	} else {
+		// Note: if cueexperiment.Flags.Modules _isn't_ set but c.Registry
+		// is, we consider that a good enough hint that modules support
+		// should be enabled and hence don't return an error in that case.
+		if cueexperiment.Flags.Modules && c.Registry == nil {
+			registry, err := modconfig.NewRegistry(&modconfig.Config{
+				Env: c.Env,
+			})
+			if err != nil {
+				// If there's an error in the registry configuration,
+				// don't error immediately, but only when we actually
+				// need to resolve modules.
+				registry = errorRegistry{err}
+			}
+			c.Registry = registry
 		}
-		c.Registry = registry
 	}
 	if err := c.loadModule(); err != nil {
 		return nil, err
@@ -399,20 +408,21 @@ func (c Config) complete() (cfg *Config, err error) {
 // loadModule loads the module file, resolves and downloads module
 // dependencies. It sets c.Module if it's empty or checks it for
 // consistency with the module file otherwise.
+//
+// Note that this function is a no-op if a module file does not exist,
+// as it is still possible to load CUE without a module.
 func (c *Config) loadModule() error {
 	// TODO: also make this work if run from outside the module?
-	mod := filepath.Join(c.ModuleRoot, modDir)
-	info, cerr := c.fileSystem.stat(mod)
+	modDir := filepath.Join(c.ModuleRoot, modDir)
+	modFile := filepath.Join(modDir, moduleFile)
+	f, cerr := c.fileSystem.openFile(modFile)
 	if cerr != nil {
-		return nil
-	}
-	// TODO remove support for legacy non-directory module.cue file
-	// by returning an error if info.IsDir is false.
-	if info.IsDir() {
-		mod = filepath.Join(mod, moduleFile)
-	}
-	f, cerr := c.fileSystem.openFile(mod)
-	if cerr != nil {
+		// If we could not load cue.mod/module.cue, check whether the reason was
+		// a legacy cue.mod file and give the user a clear error message.
+		info, cerr2 := c.fileSystem.stat(modDir)
+		if cerr2 == nil && !info.IsDir() {
+			return fmt.Errorf("cue.mod files are no longer supported; use cue.mod/module.cue")
+		}
 		return nil
 	}
 	defer f.Close()
@@ -423,13 +433,20 @@ func (c *Config) loadModule() error {
 	parseModFile := modfile.ParseNonStrict
 	if c.Registry == nil {
 		parseModFile = modfile.ParseLegacy
+	} else if c.AcceptLegacyModules {
+		// Note: technically this does not support all legacy module
+		// files because some old module files might contain non-concrete
+		// data, but that seems like an OK restriction for now at least,
+		// given that no actual instances of non-concrete data in
+		// module files have been discovered in the wild.
+		parseModFile = modfile.FixLegacy
 	}
-	mf, err := parseModFile(data, mod)
+	mf, err := parseModFile(data, modFile)
 	if err != nil {
 		return err
 	}
 	c.modFile = mf
-	if mf.Module == "" {
+	if mf.QualifiedModule() == "" {
 		// Backward compatibility: allow empty module.cue file.
 		// TODO maybe check that the rest of the fields are empty too?
 		return nil
@@ -437,23 +454,22 @@ func (c *Config) loadModule() error {
 	if c.Module != "" && c.Module != mf.Module {
 		return errors.Newf(token.NoPos, "inconsistent modules: got %q, want %q", mf.Module, c.Module)
 	}
-	c.Module = mf.Module
+	c.Module = mf.QualifiedModule()
 	return nil
 }
 
-func (c Config) isRoot(dir string) bool {
-	fs := &c.fileSystem
+func (c Config) isModRoot(dir string) bool {
 	// Note: cue.mod used to be a file. We still allow both to match.
-	_, err := fs.stat(filepath.Join(dir, modDir))
+	_, err := c.fileSystem.stat(filepath.Join(dir, modDir))
 	return err == nil
 }
 
-// findRoot returns the module root that's ancestor
+// findModRoot returns the module root that's ancestor
 // of the given absolute directory path, or "" if none was found.
-func (c Config) findRoot(absDir string) string {
+func (c Config) findModRoot(absDir string) string {
 	abs := absDir
 	for {
-		if c.isRoot(abs) {
+		if c.isModRoot(abs) {
 			return abs
 		}
 		d := filepath.Dir(abs)
@@ -473,7 +489,7 @@ func (c *Config) newErrInstance(err error) *build.Instance {
 	i := c.Context.NewInstance("", nil)
 	i.Root = c.ModuleRoot
 	i.Module = c.Module
-	i.Err = errors.Promote(err, "instance")
+	i.Err = errors.Promote(err, "")
 	return i
 }
 

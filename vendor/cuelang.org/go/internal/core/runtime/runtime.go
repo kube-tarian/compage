@@ -17,6 +17,9 @@ package runtime
 import (
 	"cuelang.org/go/cue/build"
 	"cuelang.org/go/internal"
+	"cuelang.org/go/internal/core/adt"
+	"cuelang.org/go/internal/cuedebug"
+	"cuelang.org/go/internal/cueexperiment"
 )
 
 // A Runtime maintains data structures for indexing and reuse for evaluation.
@@ -29,11 +32,20 @@ type Runtime struct {
 	// the kind in a file-level @extern(kind) attribute.
 	interpreters map[string]Interpreter
 
-	version internal.EvaluatorVersion
+	version  internal.EvaluatorVersion
+	topoSort bool
+
+	flags cuedebug.Config
 }
 
-func (r *Runtime) EvaluatorVersion() internal.EvaluatorVersion {
-	return r.version
+func (r *Runtime) Settings() (internal.EvaluatorVersion, cuedebug.Config) {
+	return r.version, r.flags
+}
+
+func (r *Runtime) ConfigureOpCtx(ctx *adt.OpContext) {
+	ctx.Version = r.version
+	ctx.TopoSort = r.topoSort
+	ctx.Config = r.flags
 }
 
 func (r *Runtime) SetBuildData(b *build.Instance, x interface{}) {
@@ -45,19 +57,40 @@ func (r *Runtime) BuildData(b *build.Instance) (x interface{}, ok bool) {
 	return x, ok
 }
 
-// New is a wrapper for NewVersioned(internal.DefaultVersion).
+// New is short for [NewWithSettings] while obeying `CUE_EXPERIMENT=evalv3`
+// for the evaluator version and using zero [cuedebug] flags.
 func New() *Runtime {
 	r := &Runtime{}
 	r.Init()
 	return r
 }
 
-// NewVersioned creates a new Runtime using the given runtime version.
-// The builtins registered with RegisterBuiltin are available for evaluation.
-func NewVersioned(v internal.EvaluatorVersion) *Runtime {
-	r := &Runtime{version: v}
+// NewWithSettings creates a new Runtime using the given runtime version and
+// debug flags. The builtins registered with RegisterBuiltin are available for
+// evaluation.
+func NewWithSettings(v internal.EvaluatorVersion, flags cuedebug.Config) *Runtime {
+	r := &Runtime{flags: flags}
 	r.Init()
+	r.version = v
 	return r
+}
+
+// SetVersion sets the version to use for the Runtime. This should only be set
+// before first use.
+func (r *Runtime) SetVersion(v internal.EvaluatorVersion) {
+	r.version = v
+}
+
+// SetTopologicalSort sets whether or not to use topological sorting
+// for the Runtime.
+func (r *Runtime) SetTopologicalSort(b bool) {
+	r.topoSort = b
+}
+
+// SetDebugOptions sets the debug flags to use for the Runtime. This should only
+// be set before first use.
+func (r *Runtime) SetDebugOptions(flags *cuedebug.Config) {
+	r.flags = *flags
 }
 
 // IsInitialized reports whether the runtime has been initialized.
@@ -77,4 +110,12 @@ func (r *Runtime) Init() {
 	r.index.builtinShort = sharedIndex.builtinShort
 
 	r.loaded = map[*build.Instance]interface{}{}
+
+	cueexperiment.Init()
+	if cueexperiment.Flags.EvalV3 {
+		r.version = internal.DevVersion
+	} else {
+		r.version = internal.DefaultVersion
+	}
+	r.topoSort = cueexperiment.Flags.TopoSort
 }

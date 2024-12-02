@@ -13,17 +13,14 @@
 // limitations under the License.
 
 // TODO: make this package public in cuelang.org/go/encoding
-// once stabalized.
+// once stabilized.
 
 package encoding
 
 import (
-	"bytes"
 	"fmt"
 	"io"
-	"net/url"
-	"os"
-	"strings"
+	"maps"
 
 	"cuelang.org/go/cue"
 	"cuelang.org/go/cue/ast"
@@ -39,14 +36,17 @@ import (
 	"cuelang.org/go/encoding/protobuf"
 	"cuelang.org/go/encoding/protobuf/jsonpb"
 	"cuelang.org/go/encoding/protobuf/textproto"
+	"cuelang.org/go/encoding/toml"
 	"cuelang.org/go/internal"
+	"cuelang.org/go/internal/encoding/yaml"
 	"cuelang.org/go/internal/filetypes"
-	"cuelang.org/go/internal/third_party/yaml"
+	"cuelang.org/go/internal/source"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 )
 
 type Decoder struct {
+	ctx            *cue.Context
 	cfg            *Config
 	closer         io.Closer
 	next           func() (ast.Expr, error)
@@ -56,19 +56,13 @@ type Decoder struct {
 	expr           ast.Expr
 	file           *ast.File
 	filename       string // may change on iteration for some formats
-	id             string
 	index          int
 	err            error
 }
 
-type interpretFunc func(*cue.Instance) (file *ast.File, id string, err error)
+type interpretFunc func(cue.Value) (file *ast.File, err error)
 type rewriteFunc func(*ast.File) (file *ast.File, err error)
 
-// ID returns a canonical identifier for the decoded object or "" if no such
-// identifier could be found.
-func (i *Decoder) ID() string {
-	return i.id
-}
 func (i *Decoder) Filename() string { return i.filename }
 
 // Interpretation returns the current interpretation detected by Detect.
@@ -103,30 +97,21 @@ func (i *Decoder) doInterpret() {
 		}
 	}
 	if i.interpretFunc != nil {
-		var r cue.Runtime
 		i.file = i.File()
-		inst, err := r.CompileFile(i.file)
-		if err != nil {
+		v := i.ctx.BuildFile(i.file)
+		if err := v.Err(); err != nil {
 			i.err = err
 			return
 		}
-		i.file, i.id, i.err = i.interpretFunc(inst)
+		i.file, i.err = i.interpretFunc(v)
 	}
-}
-
-func toFile(x ast.Expr) *ast.File {
-	return internal.ToFile(x)
-}
-
-func valueToFile(v cue.Value) *ast.File {
-	return internal.ToFile(v.Syntax())
 }
 
 func (i *Decoder) File() *ast.File {
 	if i.file != nil {
 		return i.file
 	}
-	return toFile(i.expr)
+	return internal.ToFile(i.expr)
 }
 
 func (i *Decoder) Err() error {
@@ -137,7 +122,9 @@ func (i *Decoder) Err() error {
 }
 
 func (i *Decoder) Close() {
-	i.closer.Close()
+	if i.closer != nil {
+		i.closer.Close()
+	}
 }
 
 type Config struct {
@@ -151,7 +138,7 @@ type Config struct {
 	PkgName string // package name for files to generate
 
 	Force     bool // overwrite existing files
-	Strict    bool
+	Strict    bool // strict mode for jsonschema (deprecated)
 	Stream    bool // potentially write more than one document per file
 	AllErrors bool
 
@@ -167,11 +154,13 @@ type Config struct {
 // NewDecoder returns a stream of non-rooted data expressions. The encoding
 // type of f must be a data type, but does not have to be an encoding that
 // can stream. stdin is used in case the file is "-".
-func NewDecoder(f *build.File, cfg *Config) *Decoder {
+//
+// This may change the contents of f.
+func NewDecoder(ctx *cue.Context, f *build.File, cfg *Config) *Decoder {
 	if cfg == nil {
 		cfg = &Config{}
 	}
-	i := &Decoder{filename: f.Filename, cfg: cfg}
+	i := &Decoder{filename: f.Filename, ctx: ctx, cfg: cfg}
 	i.next = func() (ast.Expr, error) {
 		if i.err != nil {
 			return nil, i.err
@@ -181,16 +170,22 @@ func NewDecoder(f *build.File, cfg *Config) *Decoder {
 
 	if file, ok := f.Source.(*ast.File); ok {
 		i.file = file
-		i.closer = io.NopCloser(strings.NewReader(""))
 		i.validate(file, f)
 		return i
 	}
 
-	rc, err := reader(f, cfg.Stdin)
-	i.closer = rc
-	i.err = err
-	if err != nil {
-		return i
+	var srcr io.Reader
+	if f.Source == nil && f.Filename == "-" {
+		// TODO: should we allow this?
+		srcr = cfg.Stdin
+	} else {
+		rc, err := source.Open(f.Filename, f.Source)
+		i.closer = rc
+		i.err = err
+		if i.err != nil {
+			return i
+		}
+		srcr = rc
 	}
 
 	// For now we assume that all encodings require UTF-8. This will not be the
@@ -199,21 +194,22 @@ func NewDecoder(f *build.File, cfg *Config) *Decoder {
 	// TODO: this code also allows UTF16, which is too permissive for some
 	// encodings. Switch to unicode.UTF8Sig once available.
 	t := unicode.BOMOverride(unicode.UTF8.NewDecoder())
-	r := transform.NewReader(rc, t)
+	r := transform.NewReader(srcr, t)
 
 	switch f.Interpretation {
 	case "":
 	case build.Auto:
 		openAPI := openAPIFunc(cfg, f)
 		jsonSchema := jsonSchemaFunc(cfg, f)
-		i.interpretFunc = func(inst *cue.Instance) (file *ast.File, id string, err error) {
-			switch i.interpretation = Detect(inst.Value()); i.interpretation {
+		i.interpretFunc = func(v cue.Value) (file *ast.File, err error) {
+
+			switch i.interpretation = Detect(v); i.interpretation {
 			case build.JSONSchema:
-				return jsonSchema(inst)
+				return jsonSchema(v)
 			case build.OpenAPI:
-				return openAPI(inst)
+				return openAPI(v)
 			}
-			return i.file, "", i.err
+			return i.file, i.err
 		}
 	case build.OpenAPI:
 		i.interpretation = build.OpenAPI
@@ -240,13 +236,26 @@ func NewDecoder(f *build.File, cfg *Config) *Decoder {
 		if i.err == nil {
 			i.doInterpret()
 		}
-	case build.JSON, build.JSONL:
+	case build.JSON:
+		b, err := io.ReadAll(r)
+		if err != nil {
+			i.err = err
+			break
+		}
+		i.expr, i.err = json.Extract(path, b)
+		if i.err == nil {
+			i.doInterpret()
+		}
+	case build.JSONL:
 		i.next = json.NewDecoder(nil, path, r).Extract
 		i.Next()
 	case build.YAML:
-		d, err := yaml.NewDecoder(path, r)
+		b, err := io.ReadAll(r)
 		i.err = err
-		i.next = d.Decode
+		i.next = yaml.NewDecoder(path, b).Decode
+		i.Next()
+	case build.TOML:
+		i.next = toml.NewDecoder(path, r).Decode
 		i.Next()
 	case build.Text:
 		b, err := io.ReadAll(r)
@@ -278,39 +287,43 @@ func NewDecoder(f *build.File, cfg *Config) *Decoder {
 }
 
 func jsonSchemaFunc(cfg *Config, f *build.File) interpretFunc {
-	return func(i *cue.Instance) (file *ast.File, id string, err error) {
-		id = f.Tags["id"]
-		if id == "" {
-			id, _ = i.Lookup("$id").String()
-		}
-		if id != "" {
-			u, err := url.Parse(id)
-			if err != nil {
-				return nil, "", errors.Wrapf(err, token.NoPos, "invalid id")
-			}
-			u.Scheme = ""
-			id = strings.TrimPrefix(u.String(), "//")
-		}
+	return func(v cue.Value) (file *ast.File, err error) {
+		tags := boolTagsForFile(f, build.JSONSchema)
 		cfg := &jsonschema.Config{
-			ID:      id,
 			PkgName: cfg.PkgName,
 
-			Strict: cfg.Strict,
+			// Note: we don't populate Strict because then we'd
+			// be ignoring the values of the other tags when it's true,
+			// and there's (deliberately) nothing that Strict does that
+			// cannot be described by the other two keywords.
+			// The strictKeywords and strictFeatures tags are
+			// set by internal/filetypes from the strict tag when appropriate.
+
+			StrictKeywords: cfg.Strict || tags["strictKeywords"],
+			StrictFeatures: cfg.Strict || tags["strictFeatures"],
 		}
-		file, err = jsonschema.Extract(i, cfg)
+		file, err = jsonschema.Extract(v, cfg)
 		// TODO: simplify currently erases file line info. Reintroduce after fix.
 		// file, err = simplify(file, err)
-		return file, id, err
+		return file, err
 	}
 }
 
 func openAPIFunc(c *Config, f *build.File) interpretFunc {
-	cfg := &openapi.Config{PkgName: c.PkgName}
-	return func(i *cue.Instance) (file *ast.File, id string, err error) {
-		file, err = openapi.Extract(i, cfg)
+	return func(v cue.Value) (file *ast.File, err error) {
+		tags := boolTagsForFile(f, build.JSONSchema)
+		file, err = openapi.Extract(v, &openapi.Config{
+			PkgName: c.PkgName,
+
+			// Note: don't populate Strict (see more detailed
+			// comment in jsonSchemaFunc)
+
+			StrictKeywords: c.Strict || tags["strictKeywords"],
+			StrictFeatures: c.Strict || tags["strictFeatures"],
+		})
 		// TODO: simplify currently erases file line info. Reintroduce after fix.
 		// file, err = simplify(file, err)
-		return file, "", err
+		return file, err
 	}
 }
 
@@ -324,27 +337,35 @@ func protobufJSONFunc(cfg *Config, file *build.File) rewriteFunc {
 	}
 }
 
-func reader(f *build.File, stdin io.Reader) (io.ReadCloser, error) {
-	switch s := f.Source.(type) {
-	case nil:
-		// Use the file name.
-	case string:
-		return io.NopCloser(strings.NewReader(s)), nil
-	case []byte:
-		return io.NopCloser(bytes.NewReader(s)), nil
-	case *bytes.Buffer:
-		// is io.Reader, but it needs to be readable repeatedly
-		if s != nil {
-			return io.NopCloser(bytes.NewReader(s.Bytes())), nil
+func boolTagsForFile(f *build.File, interp build.Interpretation) map[string]bool {
+	if f.Interpretation != build.Auto {
+		return f.BoolTags
+	}
+	defaultTags := filetypes.DefaultTagsForInterpretation(interp, filetypes.Input)
+	if len(defaultTags) == 0 {
+		return f.BoolTags
+	}
+	// We _could_ probably mutate f.Tags directly, but that doesn't
+	// seem quite right as it's been passed in from outside of internal/encoding.
+	// So go the extra mile and make a new map.
+
+	// Set values for tags that have a default value but aren't
+	// present in f.Tags.
+	var tags map[string]bool
+	for tag, val := range defaultTags {
+		if _, ok := f.BoolTags[tag]; ok {
+			continue
 		}
-	default:
-		return nil, fmt.Errorf("invalid source type %T", f.Source)
+		if tags == nil {
+			tags = make(map[string]bool)
+		}
+		tags[tag] = val
 	}
-	// TODO: should we allow this?
-	if f.Filename == "-" {
-		return io.NopCloser(stdin), nil
+	if tags == nil {
+		return f.BoolTags
 	}
-	return os.Open(f.Filename)
+	maps.Copy(tags, f.BoolTags)
+	return tags
 }
 
 func shouldValidate(i *filetypes.FileInfo) bool {

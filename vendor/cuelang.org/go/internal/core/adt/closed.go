@@ -84,7 +84,7 @@ func (v *Vertex) IsInOneOf(mask SpanType) bool {
 // IsRecursivelyClosed returns true if this value is either a definition or unified
 // with a definition.
 func (v *Vertex) IsRecursivelyClosed() bool {
-	return v.Closed || v.IsInOneOf(DefinitionSpan)
+	return v.ClosedRecursive || v.IsInOneOf(DefinitionSpan)
 }
 
 type closeNodeType uint8
@@ -180,6 +180,7 @@ func (c CloseInfo) SpawnEmbed(x Node) CloseInfo {
 		mode:     closeEmbed,
 		root:     EmbeddingSpan,
 		span:     c.span() | EmbeddingSpan,
+		decl:     c.closeInfo.Decl(),
 	}
 	return c
 }
@@ -193,6 +194,7 @@ func (c CloseInfo) SpawnGroup(x Expr) CloseInfo {
 		parent:   c.closeInfo,
 		location: x,
 		span:     c.span(),
+		decl:     c.closeInfo.Decl(),
 	}
 	return c
 }
@@ -206,6 +208,7 @@ func (c CloseInfo) SpawnSpan(x Node, t SpanType) CloseInfo {
 		location: x,
 		root:     t,
 		span:     c.span() | t,
+		decl:     c.closeInfo.Decl(),
 	}
 	return c
 }
@@ -228,6 +231,7 @@ func (c CloseInfo) SpawnRef(arc *Vertex, isDef bool, x Expr) CloseInfo {
 			parent:   c.closeInfo,
 			location: x,
 			span:     span,
+			decl:     c.closeInfo.Decl(),
 		}
 	}
 	if isDef {
@@ -294,6 +298,21 @@ type closeInfo struct {
 
 	root SpanType
 	span SpanType
+
+	// decl is the parent declaration which contains the conjuct which
+	// gave rise to this closeInfo.
+	decl Decl
+}
+
+// Returns the first non-nil Decl from c, or c's parents, if possible.
+func (c *closeInfo) Decl() Decl {
+	for c != nil && c.decl == nil {
+		c = c.parent
+	}
+	if c == nil {
+		return nil
+	}
+	return c.decl
 }
 
 // closeStats holds the administrative fields for a closeInfo value. Each
@@ -330,9 +349,10 @@ func isClosed(v *Vertex) bool {
 	// We could have used IsRecursivelyClosed here, but (effectively)
 	// implementing it again here allows us to only have to iterate over
 	// Structs once.
-	if v.Closed {
+	if v.ClosedRecursive || v.ClosedNonRecursive {
 		return true
 	}
+	// TODO(evalv3): this can be removed once we delete the evalv2 code.
 	for _, s := range v.Structs {
 		if s.IsClosed || s.IsInOneOf(DefinitionSpan) {
 			return true
@@ -344,6 +364,9 @@ func isClosed(v *Vertex) bool {
 // Accept determines whether f is allowed in n. It uses the OpContext for
 // caching administrative fields.
 func Accept(ctx *OpContext, n *Vertex, f Feature) (found, required bool) {
+	if ctx.isDevVersion() {
+		return n.accept(ctx, f), true
+	}
 	ctx.generation++
 	ctx.todo = nil
 

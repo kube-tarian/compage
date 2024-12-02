@@ -14,14 +14,13 @@
 
 package load
 
-// Files in package are to a large extent based on Go files from the following
-// Go packages:
-//    - cmd/go/internal/load
-//    - go/build
-
 import (
 	"context"
 	"fmt"
+	"io/fs"
+	"sort"
+	"strconv"
+	"strings"
 
 	"cuelang.org/go/cue/ast"
 	"cuelang.org/go/cue/build"
@@ -31,12 +30,6 @@ import (
 	"cuelang.org/go/internal/mod/modpkgload"
 	"cuelang.org/go/internal/mod/modrequirements"
 	"cuelang.org/go/mod/module"
-
-	// Trigger the unconditional loading of all core builtin packages if load
-	// is used. This was deemed the simplest way to avoid having to import
-	// this line explicitly, and thus breaking existing code, for the majority
-	// of cases, while not introducing an import cycle.
-	_ "cuelang.org/go/pkg"
 )
 
 // Instances returns the instances named by the command line arguments 'args'.
@@ -59,7 +52,9 @@ func Instances(args []string, c *Config) []*build.Instance {
 		return []*build.Instance{c.newErrInstance(err)}
 	}
 	c = newC
-
+	if len(args) == 0 {
+		args = []string{"."}
+	}
 	// TODO: This requires packages to be placed before files. At some point this
 	// could be relaxed.
 	i := 0
@@ -67,29 +62,64 @@ func Instances(args []string, c *Config) []*build.Instance {
 	}
 	pkgArgs := args[:i]
 	otherArgs := args[i:]
-
-	// Pass all arguments that look like packages to loadPackages
-	// so that they'll be available when looking up the packages
-	// that are specified on the command line.
-	// Relative import paths create a package with an associated
-	// error but it turns out that's actually OK because the cue/load
-	// logic resolves such paths without consulting pkgs.
-	pkgs, err := loadPackages(ctx, c, pkgArgs)
+	otherFiles, err := filetypes.ParseArgs(otherArgs)
 	if err != nil {
 		return []*build.Instance{c.newErrInstance(err)}
 	}
+	for _, f := range otherFiles {
+		if err := setFileSource(c, f); err != nil {
+			return []*build.Instance{c.newErrInstance(err)}
+		}
+	}
+	if c.Package != "" && c.Package != "_" && c.Package != "*" {
+		// The caller has specified an explicit package to load.
+		// This is essentially the same as passing an explicit package
+		// qualifier to all package arguments that don't already have
+		// one. We add that qualifier here so that there's a distinction
+		// between package paths specified as arguments, which
+		// have the qualifier added, and package paths that are dependencies
+		// of those, which don't.
+		pkgArgs1 := make([]string, 0, len(pkgArgs))
+		for _, p := range pkgArgs {
+			if ip := module.ParseImportPath(p); !ip.ExplicitQualifier {
+				ip.Qualifier = c.Package
+				p = ip.String()
+			}
+			pkgArgs1 = append(pkgArgs1, p)
+		}
+		pkgArgs = pkgArgs1
+	}
+
 	tg := newTagger(c)
+	// Pass all arguments that look like packages to loadPackages
+	// so that they'll be available when looking up the packages
+	// that are specified on the command line.
+	expandedPaths, err := expandPackageArgs(c, pkgArgs, c.Package, tg)
+	if err != nil {
+		return []*build.Instance{c.newErrInstance(err)}
+	}
+
+	var pkgs *modpkgload.Packages
+	if !c.SkipImports {
+		pkgs, err = loadPackages(ctx, c, expandedPaths, otherFiles, tg)
+		if err != nil {
+			return []*build.Instance{c.newErrInstance(err)}
+		}
+	}
 	l := newLoader(c, tg, pkgs)
 
 	if c.Context == nil {
-		c.Context = build.NewContext(
-			build.Loader(l.buildLoadFunc()),
+		opts := []build.Option{
 			build.ParseFile(c.ParseFile),
-		)
+		}
+		if f := l.loadFunc(); l != nil {
+			opts = append(opts, build.Loader(f))
+		}
+		c.Context = build.NewContext(opts...)
 	}
 
 	a := []*build.Instance{}
-	if len(args) == 0 || i > 0 {
+	if len(pkgArgs) > 0 {
 		for _, m := range l.importPaths(pkgArgs) {
 			if m.Err != nil {
 				inst := c.newErrInstance(m.Err)
@@ -100,12 +130,8 @@ func Instances(args []string, c *Config) []*build.Instance {
 		}
 	}
 
-	if len(otherArgs) > 0 {
-		files, err := filetypes.ParseArgs(otherArgs)
-		if err != nil {
-			return []*build.Instance{c.newErrInstance(err)}
-		}
-		a = append(a, l.cueFilesPackage(files))
+	if len(otherFiles) > 0 {
+		a = append(a, l.cueFilesPackage(otherFiles))
 	}
 
 	for _, p := range a {
@@ -144,12 +170,21 @@ func Instances(args []string, c *Config) []*build.Instance {
 	return a
 }
 
-func loadPackages(ctx context.Context, cfg *Config, extraPkgs []string) (*modpkgload.Packages, error) {
+// loadPackages returns packages loaded from the given package list and also
+// including imports from the given build files.
+func loadPackages(
+	ctx context.Context,
+	cfg *Config,
+	pkgs []resolvedPackageArg,
+	otherFiles []*build.File,
+	tg *tagger,
+) (*modpkgload.Packages, error) {
 	if cfg.Registry == nil || cfg.modFile == nil || cfg.modFile.Module == "" {
 		return nil, nil
 	}
+	mainModPath := cfg.modFile.QualifiedModule()
 	reqs := modrequirements.NewRequirements(
-		cfg.modFile.Module,
+		mainModPath,
 		cfg.Registry,
 		cfg.modFile.DepVersions(),
 		cfg.modFile.DefaultMajorVersions(),
@@ -158,19 +193,73 @@ func loadPackages(ctx context.Context, cfg *Config, extraPkgs []string) (*modpkg
 		FS:  cfg.fileSystem.ioFS(cfg.ModuleRoot),
 		Dir: ".",
 	}
-	allImports, err := modimports.AllImports(modimports.AllModuleFiles(mainModLoc.FS, mainModLoc.Dir))
-	if err != nil {
-		return nil, fmt.Errorf("cannot enumerate all module imports: %v", err)
+	pkgPaths := make(map[string]bool)
+	// Add any packages specified directly on the command line.
+	for _, pkg := range pkgs {
+		pkgPaths[pkg.resolvedCanonical] = true
 	}
-	// Add any packages specified on the command line so they're always
-	// available.
-	allImports = append(allImports, extraPkgs...)
+	// Add any imports found in other files.
+	for _, f := range otherFiles {
+		if f.Encoding != build.CUE {
+			// not a CUE file; assume it has no imports for now.
+			continue
+		}
+		syntax, err := cfg.fileSystem.getCUESyntax(f)
+		if err != nil {
+			return nil, fmt.Errorf("cannot get syntax for %q: %w", f.Filename, err)
+		}
+		for _, imp := range syntax.Imports {
+			pkgPath, err := strconv.Unquote(imp.Path.Value)
+			if err != nil {
+				// Should never happen.
+				return nil, fmt.Errorf("invalid import path %q in %s", imp.Path.Value, f.Filename)
+			}
+			// Canonicalize the path.
+			pkgPath = module.ParseImportPath(pkgPath).Canonical().String()
+			pkgPaths[pkgPath] = true
+		}
+	}
+	// TODO use maps.Keys when we can.
+	pkgPathSlice := make([]string, 0, len(pkgPaths))
+	for p := range pkgPaths {
+		pkgPathSlice = append(pkgPathSlice, p)
+	}
+	sort.Strings(pkgPathSlice)
 	return modpkgload.LoadPackages(
 		ctx,
 		cfg.Module,
 		mainModLoc,
 		reqs,
 		cfg.Registry,
-		allImports,
+		pkgPathSlice,
+		func(pkgPath string, mod module.Version, fsys fs.FS, mf modimports.ModuleFile) bool {
+			if !cfg.Tools && strings.HasSuffix(mf.FilePath, "_tool.cue") {
+				return false
+			}
+			isTest := strings.HasSuffix(mf.FilePath, "_test.cue")
+			var tagIsSet func(string) bool
+			if mod.Path() == mainModPath {
+				// In the main module.
+				if isTest && !cfg.Tests {
+					return false
+				}
+				tagIsSet = tg.tagIsSet
+			} else {
+				// Outside the main module.
+				if isTest {
+					// Don't traverse test files outside the main module
+					return false
+				}
+				// Treat all build tag keys as unset.
+				tagIsSet = func(string) bool {
+					return false
+				}
+			}
+			if err := shouldBuildFile(mf.Syntax, tagIsSet); err != nil {
+				// Later build logic should pick up and report the same error.
+				return false
+			}
+			return true
+		},
 	), nil
 }

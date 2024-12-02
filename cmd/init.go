@@ -54,8 +54,8 @@ func createOrUpdateDefaultConfigFile() error {
 
 	if language != "go" && language != "dotnet" {
 		message := fmt.Sprintf("language %s is not supported", language)
-		log.Errorf(message)
-		return fmt.Errorf(message)
+		log.Errorf("%s", message)
+		return fmt.Errorf("%s", message)
 	}
 
 	_, err = os.Create(configFilePath)

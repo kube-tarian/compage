@@ -237,26 +237,32 @@ func (pkgs *Packages) findLocalPackage(pkgPath string) ([]module.SourceLoc, erro
 }
 
 func isDirWithCUEFiles(loc module.SourceLoc) (bool, error) {
-	// It would be nice if we could inspect the error returned from
-	// ReadDir to see if it's failing because it's not a directory,
-	// but unfortunately that doesn't seem to be something defined
-	// by the Go fs interface.
-	fi, err := fs.Stat(loc.FS, loc.Dir)
-	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			return false, err
-		}
-		return false, nil
-	}
-	if !fi.IsDir() {
-		return false, nil
-	}
+	// It would be nice if we could inspect the error returned from ReadDir to see
+	// if it's failing because it's not a directory, but unfortunately that doesn't
+	// seem to be something defined by the Go fs interface.
+	// For now, catching fs.ErrNotExist seems to be enough.
 	entries, err := fs.ReadDir(loc.FS, loc.Dir)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
 		return false, err
 	}
 	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".cue") && e.Type().IsRegular() {
+		if !strings.HasSuffix(e.Name(), ".cue") {
+			continue
+		}
+		ftype := e.Type()
+		// If the directory entry is a symlink, stat it to obtain the info for the
+		// link target instead of the link itself.
+		if ftype&fs.ModeSymlink != 0 {
+			info, err := fs.Stat(loc.FS, filepath.Join(loc.Dir, e.Name()))
+			if err != nil {
+				continue // Ignore broken symlinks.
+			}
+			ftype = info.Mode()
+		}
+		if ftype.IsRegular() {
 			return true, nil
 		}
 	}

@@ -27,9 +27,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"cuelabs.dev/go/oci/ociregistry"
+	"cuelabs.dev/go/oci/ociregistry/ociref"
 	"cuelang.org/go/internal/mod/semver"
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -58,8 +60,15 @@ type Resolver interface {
 	// will hold the prefix that all versions of the module in its
 	// repository have. That prefix will be followed by the version
 	// itself.
+	//
+	// If there is no registry configured for the module, it returns
+	// an [ErrRegistryNotFound] error.
 	ResolveToRegistry(mpath, vers string) (RegistryLocation, error)
 }
+
+// ErrRegistryNotFound is returned by [Resolver.ResolveToRegistry]
+// when there is no registry configured for a module.
+var ErrRegistryNotFound = fmt.Errorf("no registry configured for module")
 
 // RegistryLocation holds a registry and a location within it
 // that a specific module (or set of versions for a module)
@@ -98,19 +107,22 @@ func NewClientWithResolver(resolver Resolver) *Client {
 }
 
 // GetModule returns the module instance for the given version.
-// It returns an error that satisfies errors.Is(ErrNotFound) if the
+// It returns an error that satisfies [errors.Is]([ErrNotFound]) if the
 // module is not present in the store at this version.
 func (c *Client) GetModule(ctx context.Context, m module.Version) (*Module, error) {
 	loc, err := c.resolve(m)
 	if err != nil {
+		if errors.Is(err, ErrRegistryNotFound) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 	rd, err := loc.Registry.GetTag(ctx, loc.Repository, loc.Tag)
 	if err != nil {
-		if errors.Is(err, ociregistry.ErrManifestUnknown) {
+		if isNotExist(err) {
 			return nil, fmt.Errorf("module %v: %w", m, ErrNotFound)
 		}
-		return nil, fmt.Errorf("module %v: %v", m, err)
+		return nil, fmt.Errorf("module %v: %w", m, err)
 	}
 	defer rd.Close()
 	data, err := io.ReadAll(rd)
@@ -118,20 +130,23 @@ func (c *Client) GetModule(ctx context.Context, m module.Version) (*Module, erro
 		return nil, err
 	}
 
-	return c.GetModuleWithManifest(ctx, m, data, rd.Descriptor().MediaType)
+	return c.GetModuleWithManifest(m, data, rd.Descriptor().MediaType)
 }
 
 // GetModuleWithManifest returns a module instance given
 // the top level manifest contents, without querying its tag.
-// It assumes that the module will be tagged with the given
-// version.
-func (c *Client) GetModuleWithManifest(ctx context.Context, m module.Version, contents []byte, mediaType string) (*Module, error) {
+// It assumes that the module will be tagged with the given version.
+func (c *Client) GetModuleWithManifest(m module.Version, contents []byte, mediaType string) (*Module, error) {
 	loc, err := c.resolve(m)
 	if err != nil {
+		// Note: don't return [ErrNotFound] here because if we've got the
+		// manifest we should be pretty sure that the module actually
+		// exists, so it's a harder error than if we're getting the module
+		// by tag.
 		return nil, err
 	}
 
-	manifest, err := unmarshalManifest(ctx, contents, mediaType)
+	manifest, err := unmarshalManifest(contents, mediaType)
 	if err != nil {
 		return nil, fmt.Errorf("module %v: %v", m, err)
 	}
@@ -159,16 +174,25 @@ func (c *Client) GetModuleWithManifest(ctx context.Context, m module.Version, co
 // sorted in semver order.
 // If m has a major version suffix, only versions with that major version will
 // be returned.
-func (c *Client) ModuleVersions(ctx context.Context, m string) ([]string, error) {
+func (c *Client) ModuleVersions(ctx context.Context, m string) (_req []string, _err0 error) {
 	mpath, major, hasMajor := module.SplitPathVersion(m)
 	if !hasMajor {
 		mpath = m
 	}
 	loc, err := c.resolver.ResolveToRegistry(mpath, "")
 	if err != nil {
+		if errors.Is(err, ErrRegistryNotFound) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	versions := []string{}
+	if !ociref.IsValidRepository(loc.Repository) {
+		// If it's not a valid repository, it can't be used in an OCI
+		// request, so return an empty slice rather than the
+		// "invalid OCI request" error that a registry can return.
+		return nil, nil
+	}
 	// Note: do not use c.repoName because that always expects
 	// a module path with a major version.
 	iter := loc.Registry.Tags(ctx, loc.Repository, "")
@@ -188,7 +212,7 @@ func (c *Client) ModuleVersions(ctx context.Context, m string) ([]string, error)
 		return true
 	})
 	if _err != nil && !isNotExist(_err) {
-		return nil, _err
+		return nil, fmt.Errorf("module %v: %w", m, _err)
 	}
 	semver.Sort(versions)
 	return versions, nil
@@ -208,7 +232,15 @@ type checkedModule struct {
 
 // putCheckedModule is like [Client.PutModule] except that it allows the
 // caller to do some additional checks (see [CheckModule] for more info).
-func (c *Client) putCheckedModule(ctx context.Context, m *checkedModule) error {
+func (c *Client) putCheckedModule(ctx context.Context, m *checkedModule, meta *Metadata) error {
+	var annotations map[string]string
+	if meta != nil {
+		annotations0, err := meta.annotations()
+		if err != nil {
+			return fmt.Errorf("invalid metadata: %v", err)
+		}
+		annotations = annotations0
+	}
 	loc, err := c.resolve(m.mv)
 	if err != nil {
 		return err
@@ -239,6 +271,7 @@ func (c *Client) putCheckedModule(ctx context.Context, m *checkedModule) error {
 			MediaType: moduleFileMediaType,
 			Size:      int64(len(m.modFileContent)),
 		}},
+		Annotations: annotations,
 	}
 
 	if _, err := loc.Registry.PushBlob(ctx, loc.Repository, manifest.Layers[0], io.NewSectionReader(m.blobr, 0, m.size)); err != nil {
@@ -260,15 +293,20 @@ func (c *Client) putCheckedModule(ctx context.Context, m *checkedModule) error {
 // PutModule puts a module whose contents are held as a zip archive inside f.
 // It assumes all the module dependencies are correctly resolved and present
 // inside the cue.mod/module.cue file.
-//
-// TODO check deps are resolved correctly? Or is that too domain-specific for this package?
-// Is it a problem to call zip.CheckZip twice?
 func (c *Client) PutModule(ctx context.Context, m module.Version, r io.ReaderAt, size int64) error {
+	return c.PutModuleWithMetadata(ctx, m, r, size, nil)
+}
+
+// PutModuleWithMetadata is like [Client.PutModule] except that it also
+// includes the given metadata inside the module's manifest.
+// If meta is nil, no metadata will be included, otherwise
+// all fields in meta must be valid and non-empty.
+func (c *Client) PutModuleWithMetadata(ctx context.Context, m module.Version, r io.ReaderAt, size int64, meta *Metadata) error {
 	cm, err := checkModule(m, r, size)
 	if err != nil {
 		return err
 	}
-	return c.putCheckedModule(ctx, cm)
+	return c.putCheckedModule(ctx, cm, meta)
 }
 
 // checkModule checks a module's zip file before uploading it.
@@ -312,17 +350,11 @@ func checkModFile(m module.Version, f *zip.File) ([]byte, *modfile.File, error) 
 	if err != nil {
 		return nil, nil, err
 	}
-	if mf.Module != m.Path() {
-		return nil, nil, fmt.Errorf("module path %q found in %s does not match module path being published %q", mf.Module, f.Name, m.Path())
-	}
-	_, major, ok := module.SplitPathVersion(mf.Module)
-	if !ok {
-		// Note: can't happen because we already know that mf.Module is the same
-		// as m.Path which is a valid module path.
-		return nil, nil, fmt.Errorf("invalid module path %q", mf.Module)
+	if mf.QualifiedModule() != m.Path() {
+		return nil, nil, fmt.Errorf("module path %q found in %s does not match module path being published %q", mf.QualifiedModule(), f.Name, m.Path())
 	}
 	wantMajor := semver.Major(m.Version())
-	if major != wantMajor {
+	if major := mf.MajorVersion(); major != wantMajor {
 		// This can't actually happen because the zip checker checks the major version
 		// that's being published to, so the above path check also implicitly checks that.
 		return nil, nil, fmt.Errorf("major version %q found in %s does not match version being published %q", major, f.Name, m.Version())
@@ -360,6 +392,12 @@ func (m *Module) ModuleFile(ctx context.Context) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
+// Metadata returns the metadata associated with the module.
+// If there is none, it returns (nil, nil).
+func (m *Module) Metadata() (*Metadata, error) {
+	return newMetadataFromAnnotations(m.manifest.Annotations)
+}
+
 // GetZip returns a reader that can be used to read the contents of the zip
 // archive containing the module files. The reader should be closed after use,
 // and the contents should not be assumed to be correct until the close
@@ -391,7 +429,7 @@ func (c *Client) resolve(m module.Version) (RegistryLocation, error) {
 	return loc, nil
 }
 
-func unmarshalManifest(ctx context.Context, data []byte, mediaType string) (*ociregistry.Manifest, error) {
+func unmarshalManifest(data []byte, mediaType string) (*ociregistry.Manifest, error) {
 	if !isJSON(mediaType) {
 		return nil, fmt.Errorf("expected JSON media type but %q does not look like JSON", mediaType)
 	}
@@ -403,7 +441,24 @@ func unmarshalManifest(ctx context.Context, data []byte, mediaType string) (*oci
 }
 
 func isNotExist(err error) bool {
-	return errors.Is(err, ociregistry.ErrNameUnknown) || errors.Is(err, ociregistry.ErrNameInvalid)
+	if errors.Is(err, ociregistry.ErrNameUnknown) ||
+		errors.Is(err, ociregistry.ErrNameInvalid) {
+		return true
+	}
+	// A 403 error might have been sent as a response
+	// without explicitly including a "denied" error code.
+	// We treat this as a "not found" error because there's
+	// nothing the user can do about it.
+	//
+	// Also, some registries return an invalid error code with a 404
+	// response (see https://cuelang.org/issue/2982), so it
+	// seems reasonable to treat that as a non-found error too.
+	if herr := ociregistry.HTTPError(nil); errors.As(err, &herr) {
+		statusCode := herr.StatusCode()
+		return statusCode == http.StatusForbidden ||
+			statusCode == http.StatusNotFound
+	}
+	return false
 }
 
 func isModule(m *ocispec.Manifest) bool {

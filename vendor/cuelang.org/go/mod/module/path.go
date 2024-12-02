@@ -5,17 +5,23 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
+	"cuelang.org/go/cue/ast"
 	"cuelang.org/go/internal/mod/semver"
 )
 
 // The following regular expressions come from https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests
 // and ensure that we can store modules inside OCI registries.
 var (
-	basePathPat = regexp.MustCompile(`^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*$`)
-	tagPat      = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$`)
+	basePathPat = sync.OnceValue(func() *regexp.Regexp {
+		return regexp.MustCompile(`^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*$`)
+	})
+	tagPat = sync.OnceValue(func() *regexp.Regexp {
+		return regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$`)
+	})
 )
 
 // Check checks that a given module path, version pair is valid.
@@ -52,18 +58,10 @@ func firstPathOK(r rune) bool {
 
 // modPathOK reports whether r can appear in a module path element.
 // Paths can be ASCII letters, ASCII digits, and limited ASCII punctuation: - . _ and ~.
-//
-// This matches what "go get" has historically recognized in import paths,
-// and avoids confusing sequences like '%20' or '+' that would change meaning
-// if used in a URL.
-//
-// TODO(rsc): We would like to allow Unicode letters, but that requires additional
-// care in the safe encoding (see "escaped paths" above).
 func modPathOK(r rune) bool {
 	if r < utf8.RuneSelf {
-		return r == '-' || r == '.' || r == '_' || r == '~' ||
+		return r == '-' || r == '.' || r == '_' ||
 			'0' <= r && r <= '9' ||
-			'A' <= r && r <= 'Z' ||
 			'a' <= r && r <= 'z'
 	}
 	return false
@@ -77,7 +75,10 @@ func modPathOK(r rune) bool {
 // otherwise-unambiguous on the command line and historically used for some
 // binary names (such as '++' as a suffix for compiler binaries and wrappers).
 func importPathOK(r rune) bool {
-	return modPathOK(r) || r == '+'
+	return modPathOK(r) ||
+		r == '+' ||
+		r == '~' ||
+		'A' <= r && r <= 'Z'
 }
 
 // fileNameOK reports whether r can appear in a file name.
@@ -132,8 +133,8 @@ func CheckPathWithoutVersion(basePath string) (err error) {
 		}
 	}
 	// Sanity check agreement with OCI specs.
-	if !basePathPat.MatchString(basePath) {
-		return fmt.Errorf("non-conforming path %q", basePath)
+	if !basePathPat().MatchString(basePath) {
+		return fmt.Errorf("path does not conform to OCI repository name restrictions; see https://github.com/opencontainers/distribution-spec/blob/HEAD/spec.md#pulling-manifests")
 	}
 	return nil
 }
@@ -147,9 +148,11 @@ func CheckPathWithoutVersion(basePath string) (err error) {
 // ASCII digits, dots (U+002E), and dashes (U+002D);
 // it must contain at least one dot and cannot start with a dash.
 //
-// Second, there must be a final major version of the form
+// Second, there may be a final major version of the form
 // @vN where N looks numeric
 // (ASCII digits) and must not begin with a leading zero.
+// Without such a major version, the major version is assumed
+// to be v0.
 //
 // Third, no path element may begin with a dot.
 func CheckPath(mpath string) (err error) {
@@ -163,17 +166,18 @@ func CheckPath(mpath string) (err error) {
 	}()
 
 	basePath, vers, ok := SplitPathVersion(mpath)
-	if !ok {
-		return fmt.Errorf("no major version found in module path")
-	}
-	if semver.Major(vers) != vers {
-		return fmt.Errorf("path can contain major version only")
+	if ok {
+		if semver.Major(vers) != vers {
+			return fmt.Errorf("path can contain major version only")
+		}
+		if !tagPat().MatchString(vers) {
+			return fmt.Errorf("non-conforming version %q", vers)
+		}
+	} else {
+		basePath = mpath
 	}
 	if err := CheckPathWithoutVersion(basePath); err != nil {
 		return err
-	}
-	if !tagPat.MatchString(vers) {
-		return fmt.Errorf("non-conforming version %q", vers)
 	}
 	return nil
 }
@@ -263,10 +267,16 @@ func checkElem(elem string, kind pathKind) error {
 	if strings.Count(elem, ".") == len(elem) {
 		return fmt.Errorf("invalid path element %q", elem)
 	}
-	if elem[0] == '.' && kind == modulePath {
-		return fmt.Errorf("leading dot in path element")
-	}
-	if elem[len(elem)-1] == '.' {
+
+	if kind == modulePath {
+
+		if r := rune(elem[0]); r == '.' || r == '_' || r == '-' {
+			return fmt.Errorf("leading %q in path element", r)
+		}
+		if r := rune(elem[len(elem)-1]); r == '.' || r == '_' || r == '-' {
+			return fmt.Errorf("trailing %q in path element", r)
+		}
+	} else if elem[len(elem)-1] == '.' {
 		return fmt.Errorf("trailing dot in path element")
 	}
 	for _, r := range elem {
@@ -411,8 +421,9 @@ type ImportPath struct {
 	// This is not guaranteed to be a valid CUE identifier.
 	Qualifier string
 
-	// ExplicitQualifier holds whether the qualifier was explicitly
-	// present in the import path.
+	// ExplicitQualifier holds whether the qualifier will
+	// always be added regardless of whether it matches
+	// the final path element.
 	ExplicitQualifier bool
 }
 
@@ -435,7 +446,14 @@ func (parts ImportPath) Unqualified() ImportPath {
 }
 
 func (parts ImportPath) String() string {
-	if parts.Version == "" && !parts.ExplicitQualifier {
+	needQualifier := parts.ExplicitQualifier
+	if !needQualifier && parts.Qualifier != "" {
+		_, last, _ := cutLast(parts.Path, "/")
+		if last != "" && last != parts.Qualifier {
+			needQualifier = true
+		}
+	}
+	if parts.Version == "" && !needQualifier {
 		// Fast path.
 		return parts.Path
 	}
@@ -445,7 +463,7 @@ func (parts ImportPath) String() string {
 		buf.WriteByte('@')
 		buf.WriteString(parts.Version)
 	}
-	if parts.ExplicitQualifier {
+	if needQualifier {
 		buf.WriteByte(':')
 		buf.WriteString(parts.Qualifier)
 	}
@@ -453,6 +471,7 @@ func (parts ImportPath) String() string {
 }
 
 // ParseImportPath returns the various components of an import path.
+// It does not check the result for validity.
 func ParseImportPath(p string) ImportPath {
 	var parts ImportPath
 	pathWithoutQualifier := p
@@ -472,6 +491,9 @@ func ParseImportPath(p string) ImportPath {
 		} else {
 			parts.Qualifier = parts.Path
 		}
+		if !ast.IsValidIdent(parts.Qualifier) || strings.HasPrefix(parts.Qualifier, "#") || parts.Qualifier == "_" {
+			parts.Qualifier = ""
+		}
 	}
 	return parts
 }
@@ -486,4 +508,11 @@ func CheckPathMajor(v, pathMajor string) error {
 		}
 	}
 	return nil
+}
+
+func cutLast(s, sep string) (before, after string, found bool) {
+	if i := strings.LastIndex(s, sep); i >= 0 {
+		return s[:i], s[i+len(sep):], true
+	}
+	return "", s, false
 }

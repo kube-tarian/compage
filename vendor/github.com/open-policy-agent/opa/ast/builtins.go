@@ -120,6 +120,7 @@ var DefaultBuiltins = [...]*Builtin{
 	Lower,
 	Upper,
 	Contains,
+	StringCount,
 	StartsWith,
 	EndsWith,
 	Split,
@@ -142,6 +143,7 @@ var DefaultBuiltins = [...]*Builtin{
 
 	// Encoding
 	JSONMarshal,
+	JSONMarshalWithOptions,
 	JSONUnmarshal,
 	JSONIsValid,
 	Base64Encode,
@@ -1108,6 +1110,19 @@ var Contains = &Builtin{
 	Categories: stringsCat,
 }
 
+var StringCount = &Builtin{
+	Name:        "strings.count",
+	Description: "Returns the number of non-overlapping instances of a substring in a string.",
+	Decl: types.NewFunction(
+		types.Args(
+			types.Named("search", types.S).Description("string to search in"),
+			types.Named("substring", types.S).Description("substring to look for"),
+		),
+		types.Named("output", types.N).Description("count of occurrences, `0` if not found"),
+	),
+	Categories: stringsCat,
+}
+
 var StartsWith = &Builtin{
 	Name:        "startswith",
 	Description: "Returns true if the search string begins with the base string.",
@@ -1166,7 +1181,7 @@ var Split = &Builtin{
 			types.Named("x", types.S).Description("string that is split"),
 			types.Named("delimiter", types.S).Description("delimiter used for splitting"),
 		),
-		types.Named("ys", types.NewArray(nil, types.S)).Description("splitted parts"),
+		types.Named("ys", types.NewArray(nil, types.S)).Description("split parts"),
 	),
 	Categories: stringsCat,
 }
@@ -1232,7 +1247,7 @@ var Trim = &Builtin{
 
 var TrimLeft = &Builtin{
 	Name:        "trim_left",
-	Description: "Returns `value` with all leading instances of the `cutset` chartacters removed.",
+	Description: "Returns `value` with all leading instances of the `cutset` characters removed.",
 	Decl: types.NewFunction(
 		types.Args(
 			types.Named("value", types.S).Description("string to trim"),
@@ -1258,7 +1273,7 @@ var TrimPrefix = &Builtin{
 
 var TrimRight = &Builtin{
 	Name:        "trim_right",
-	Description: "Returns `value` with all trailing instances of the `cutset` chartacters removed.",
+	Description: "Returns `value` with all trailing instances of the `cutset` characters removed.",
 	Decl: types.NewFunction(
 		types.Args(
 			types.Named("value", types.S).Description("string to trim"),
@@ -1341,7 +1356,7 @@ var RenderTemplate = &Builtin{
 // Marked non-deterministic because it relies on RNG internally.
 var RandIntn = &Builtin{
 	Name:        "rand.intn",
-	Description: "Returns a random integer between `0` and `n` (`n` exlusive). If `n` is `0`, then `y` is always `0`. For any given argument pair (`str`, `n`), the output will be consistent throughout a query evaluation.",
+	Description: "Returns a random integer between `0` and `n` (`n` exclusive). If `n` is `0`, then `y` is always `0`. For any given argument pair (`str`, `n`), the output will be consistent throughout a query evaluation.",
 	Decl: types.NewFunction(
 		types.Args(
 			types.Named("str", types.S),
@@ -1707,6 +1722,27 @@ var JSONMarshal = &Builtin{
 	Categories: encoding,
 }
 
+var JSONMarshalWithOptions = &Builtin{
+	Name: "json.marshal_with_options",
+	Description: "Serializes the input term JSON, with additional formatting options via the `opts` parameter. " +
+		"`opts` accepts keys `pretty` (enable multi-line/formatted JSON), `prefix` (string to prefix lines with, default empty string) and `indent` (string to indent with, default `\\t`).",
+	Decl: types.NewFunction(
+		types.Args(
+			types.Named("x", types.A).Description("the term to serialize"),
+			types.Named("opts", types.NewObject(
+				[]*types.StaticProperty{
+					types.NewStaticProperty("pretty", types.B),
+					types.NewStaticProperty("indent", types.S),
+					types.NewStaticProperty("prefix", types.S),
+				},
+				types.NewDynamicProperty(types.S, types.A),
+			)).Description("encoding options"),
+		),
+		types.Named("y", types.S).Description("the JSON string representation of `x`, with configured prefix/indent string(s) as appropriate"),
+	),
+	Categories: encoding,
+}
+
 var JSONUnmarshal = &Builtin{
 	Name:        "json.unmarshal",
 	Description: "Deserializes the input string.",
@@ -1714,7 +1750,7 @@ var JSONUnmarshal = &Builtin{
 		types.Args(
 			types.Named("x", types.S).Description("a JSON string"),
 		),
-		types.Named("y", types.A).Description("the term deseralized from `x`"),
+		types.Named("y", types.A).Description("the term deserialized from `x`"),
 	),
 	Categories: encoding,
 }
@@ -1878,7 +1914,7 @@ var YAMLUnmarshal = &Builtin{
 		types.Args(
 			types.Named("x", types.S).Description("a YAML string"),
 		),
-		types.Named("y", types.A).Description("the term deseralized from `x`"),
+		types.Named("y", types.A).Description("the term deserialized from `x`"),
 	),
 	Categories: encoding,
 }
@@ -1915,7 +1951,7 @@ var HexDecode = &Builtin{
 		types.Args(
 			types.Named("x", types.S).Description("a hex-encoded string"),
 		),
-		types.Named("y", types.S).Description("deseralized from `x`"),
+		types.Named("y", types.S).Description("deserialized from `x`"),
 	),
 	Categories: encoding,
 }

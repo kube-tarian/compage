@@ -9,6 +9,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Options are functional options for creating a new Env.
+type Options func(*Pipeline)
+
 // Parse parses a pipeline. It does not apply interpolation.
 // Warnings are passed through the err return:
 //
@@ -35,6 +38,7 @@ func Parse(src io.Reader) (*Pipeline, error) {
 	// with when handling different structural representations of the same
 	// configuration. Then decode _that_ into a pipeline.
 	p := new(Pipeline)
+
 	return p, ordered.Unmarshal(n, p)
 }
 

@@ -107,7 +107,7 @@ func (p Pos) String() string {
 }
 
 // NoPos is the zero value for Pos; there is no file and line information
-// associated with it, and NoPos().IsValid() is false. NoPos is always
+// associated with it, and [Pos.IsValid] is false. NoPos is always
 // smaller than any other Pos value. The corresponding Position value
 // for NoPos is the zero value for Position.
 var NoPos = Pos{}
@@ -115,41 +115,37 @@ var NoPos = Pos{}
 // RelPos indicates the relative position of token to the previous token.
 type RelPos int
 
+//go:generate go run golang.org/x/tools/cmd/stringer -type=RelPos -linecomment
+
 const (
 	// NoRelPos indicates no relative position is specified.
-	NoRelPos RelPos = iota
+	NoRelPos RelPos = iota // invalid
 
 	// Elided indicates that the token for which this position is defined is
 	// not rendered at all.
-	Elided
+	Elided // elided
 
-	// NoSpace indicates there is no whitespace after this token.
-	NoSpace
+	// NoSpace indicates there is no whitespace before this token.
+	NoSpace // nospace
 
-	// Blank means there is horizontal space after this token.
-	Blank
+	// Blank means there is horizontal space before this token.
+	Blank // blank
 
-	// Newline means there is a single newline after this token.
-	Newline
+	// Newline means there is a single newline before this token.
+	Newline // newline
 
-	// NewSection means there are two or more newlines after this token.
-	NewSection
+	// NewSection means there are two or more newlines before this token.
+	NewSection // section
 
 	relMask  = 0xf
 	relShift = 4
 )
 
-var relNames = []string{
-	"invalid", "elided", "nospace", "blank", "newline", "section",
-}
-
-func (p RelPos) String() string { return relNames[p] }
-
 func (p RelPos) Pos() Pos {
 	return Pos{nil, int(p)}
 }
 
-// HasRelPos repors whether p has a relative position.
+// HasRelPos reports whether p has a relative position.
 func (p Pos) HasRelPos() bool {
 	return p.offset&relMask != 0
 
@@ -175,7 +171,7 @@ func (p Pos) IsValid() bool {
 }
 
 // IsNewline reports whether the relative information suggests this node should
-// be printed on a new lien.
+// be printed on a new line.
 func (p Pos) IsNewline() bool {
 	return p.RelPos() >= Newline
 }
@@ -287,6 +283,19 @@ func (f *File) MergeLine(line int) {
 	// are 0-based and line numbers are 1-based.
 	copy(f.lines[line:], f.lines[line+1:])
 	f.lines = f.lines[:len(f.lines)-1]
+}
+
+// Lines returns the effective line offset table of the form described by [File.SetLines].
+// Callers must not mutate the result.
+func (f *File) Lines() []int {
+	var lines []int
+	f.mutex.Lock()
+	// Unfortunate that we have to loop, but we use our own type.
+	for _, line := range f.lines {
+		lines = append(lines, int(line))
+	}
+	f.mutex.Unlock()
+	return lines
 }
 
 // SetLines sets the line offsets for a file and reports whether it succeeded.
