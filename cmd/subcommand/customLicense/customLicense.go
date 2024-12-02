@@ -1,6 +1,6 @@
-package customLicense
+package customlicense
 
-import (
+import (	
 	"io"
 	"net/http"
 	"os"

@@ -67,11 +67,17 @@ func (xml *XMLConvertCmd) run(cmd *cobra.Command, args []string) {
 	// Check if only one output file is provided
 	if len(outputFiles) == 1 {
 		fileExtension := strings.Split(outputFiles[0], ".")[len(strings.Split(outputFiles[0], "."))-1]
-		CreateFile(xmlData, outputFiles[0], fileExtension)
+		err := CreateFile(xmlData, outputFiles[0], fileExtension)
+		if err != nil {
+			xml.logger.Fatal(err)
+		}
 	} else {
 		for _, file := range outputFiles {
 			fileExtension := strings.Split(file, ".")[len(strings.Split(file, "."))-1]
-			CreateFile(xmlData, file, fileExtension)
+			err := CreateFile(xmlData, file, fileExtension)
+			if err != nil {
+				xml.logger.Fatal(err)
+			}
 		}
 	}
 }

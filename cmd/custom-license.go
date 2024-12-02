@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"github.com/intelops/compage/cmd/subcommand/customLicense"
+	"github.com/intelops/compage/cmd/subcommand/customlicense"
 	"github.com/sirupsen/logrus"
 )
 
@@ -14,8 +14,8 @@ func init() {
 	})
 
 	// Create the instance for customlicense
-	customlicense := customLicense.NewCustomLicenseCmd(logger)
+	customLicense := customlicense.NewCustomLicenseCmd(logger)
 
 	// Add Subcommand for the root command
-	rootCmd.AddCommand(customlicense.Execute())
+	rootCmd.AddCommand(customLicense.Execute())
 }
